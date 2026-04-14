@@ -4,13 +4,11 @@ import torch.nn as nn
 import argparse
 import yaml
 import os
-from utils.utils import get_time_str,check_dir,draw_loss_line,draw_mape_node,get_randmask,get_block_mask, cal_shortest_path_length
+from utils.utils import get_time_str, check_dir, draw_loss_line, draw_mape_node, get_randmask, get_block_mask, cal_shortest_path_length
 from logger import getlogger
-# 新代码
 from model.model import STALLM_MIMO
-from model.llm import Phi2,GPT2,LLAMA3,Transformer,QWEN
-#from data.data import load_data
-from utils.metrics import MAE_torch,RMSE_torch,MAPE_torch,MAPE_torch_node,cal_metrics
+from model.llm import Phi2, GPT2, LLAMA3, Transformer, QWEN
+from utils.metrics import MAE_torch, RMSE_torch, MAPE_torch, MAPE_torch_node, cal_metrics
 from utils.argsinit import InitArgs
 import copy
 from torch.optim.lr_scheduler import ExponentialLR
@@ -22,7 +20,7 @@ import random
 import string
 from utils.ocean_dataloader import get_ocean_dataloaders, load_ocean_laplacian_embeddings
 
-# 自动检测你的电脑适合用什么 GPU（苹果 M4 就会自动识别为 'mps'）
+# 自动检测计算设备
 if torch.cuda.is_available():
     device = torch.device("cuda")
 elif torch.backends.mps.is_available():
@@ -34,382 +32,193 @@ print(f"当前使用的计算设备: {device}")
 
 random_str = lambda : ''.join(random.sample(string.ascii_letters + string.digits, 6))
 
-def TrainEpoch(loader, model, optim, loss_fn,  prompt_prefix,scaler, need_step : bool):
-    if need_step:
-        model.train()
-    else :
-        model.eval()
-        
-    loss_item = 0
-    count = 0
+class OceanScaler:
+    def __init__(self, mean_path, std_path, device):
+        self.mean = torch.tensor(np.load(mean_path).flatten(), dtype=torch.float32).to(device)
+        self.std = torch.tensor(np.load(std_path).flatten(), dtype=torch.float32).to(device)
+        self.var_indices = {
+            'flow': [0, 1],
+            'wave': [2, 3, 4],
+            'wind': [5, 6]
+        }
 
+    def inverse_transform(self, data, var_name):
+        idx = self.var_indices[var_name]
+        m = self.mean[idx].view(1, 1, 1, -1)
+        s = self.std[idx].view(1, 1, 1, -1)
+        return data * s + m
 
+def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool):
+    model.train() if need_step else model.eval()
+    loss_item, count = 0, 0
+    chosen_vars = args.predict_vars.split(',') 
 
-    for input, target, timestamp,cond_mask,ob_mask in loader:
-        input = input.to(device)
-        target = target.to(device)
-        timestamp = timestamp.to(device)
-        cond_mask = cond_mask.to(device)
-        ob_mask = ob_mask.to(device)
-        #(B,T,N,F)
-        B,T,N,F = input.shape
+    for input, target, timestamp, cond_mask, ob_mask in loader:
+        input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
+        cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
+        B, T, N, F = input.shape
 
-        if args.task == 'prediction':
-            cond_mask = ob_mask[:,:T] #get_randmask(cond_mask,0,0.1)
-        if args.trainset_dynamic_missing and need_step:
-            cond_mask = get_randmask(cond_mask,0,0.1)
+        input_data = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+        predict_dict, other_loss = model(input_data, timestamp, prompt_prefix, cond_mask)
 
-        input = torch.where(cond_mask==0,0,input)
-        input = input.permute(0,2,1,3).contiguous().view(B,N,-1)
+        total_loss = 0
+        valid_channels = 0
 
-        # 新代码：接收字典输出
-        predict_dict, other_loss = model(input, timestamp, prompt_prefix, cond_mask)
+        # 💡 核心升级：通道级统一标准化 Loss
+        # 不再使用任何手动权重，而是拆解到最细粒度的各个物理分量。
+        # 由于它们都已被 Z-score 归一化，分布完全一致，因此各通道的 Loss 求平均就是绝对的均等。
+        for var in chosen_vars:
+            idx = scaler.var_indices[var]
+            pred = predict_dict[var].view(B, N, -1, len(idx)).permute(0, 2, 1, 3).contiguous()
+            targ_sub = target[:, -args.predict_len:, :, idx]
+            mask_sub = ob_mask[:, -args.predict_len:, :, idx].bool()
 
-        # 1. 取出洋流预测结果 (flow)
-        predict_flow = predict_dict["flow"]
-        predict_flow = predict_flow.view(B, N, -1, args.output_dim).permute(0, 2, 1, 3).contiguous()
-        
-        # 2. 反归一化
-        predict_flow = scaler.inverse_transform(predict_flow)
-
-        # 3. 构造 eval_mask
-        if args.task != 'prediction':
-            cond_mask = torch.concat((cond_mask, torch.zeros(B, ob_mask.shape[1]-cond_mask.shape[1], N, F).to(device)), dim=1)
-            eval_mask = (ob_mask - cond_mask).bool()[..., :args.output_dim]
-        else:
-            eval_mask = ob_mask[:, -args.predict_len:].bool()[..., :args.output_dim]
-
-        # 4. 匹配 target 维度并计算 Loss (目前只计算 flow 的 Loss)
-        target_flow = target[..., :args.output_dim]
-        
-        loss = loss_fn(predict_flow[eval_mask], target_flow[eval_mask])
-        
-        # 💡 未来扩展提示：如果你接上了风速预测，只需要在这里加上：
-        # predict_wind = predict_dict["wind"].view(...)...
-        # target_wind = target[..., 2:4]
-        # loss_wind = loss_fn(predict_wind[eval_mask_wind], target_wind[eval_mask_wind])
-        # loss = loss + 0.5 * loss_wind
-
-        loss_item += loss.item()
-        count += 1
-
-        if need_step:
-
-            optim.zero_grad()
-
-            L = loss
-
-            for l in other_loss:
-                L += l
+            for i in range(len(idx)):
+                p_ch = pred[..., i]
+                t_ch = targ_sub[..., i]
+                m_ch = mask_sub[..., i]
                 
-            L.backward()
+                if m_ch.sum() > 0:
+                    total_loss += loss_fn(p_ch[m_ch], t_ch[m_ch])
+                    valid_channels += 1
 
+        # 将所有有效通道的 Loss 平均，做到各要素统一标准化相加
+        if valid_channels > 0:
+            total_loss = total_loss / valid_channels
+
+        loss_item += total_loss.item(); count += 1
+        
+        if need_step:
+            optim.zero_grad()
+            L = total_loss
+            for l in other_loss: L += l
+            L.backward()
             optim.step()
 
-    if count:
-        loss_item /= count
+    return loss_item / count if count else 0
 
-    return loss_item
-
-def TestEpoch(loader, model,  prompt_prefix, scaler, save=False):
-    
+def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=None):
+    model.eval()
+    chosen_vars = args.predict_vars.split(',')
+    storage = {v: {"preds": [], "targs": [], "masks": []} for v in chosen_vars}
 
     with torch.no_grad():
-        model.eval()
-        targets = []
-        predicts = []
-        eval_masks = []
+        for input, target, timestamp, cond_mask, ob_mask in loader:
+            input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
+            cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
+            B, T, N, F = input.shape
 
-        for input, target, timestamp,cond_mask,ob_mask in loader:
-            input = input.to(device)
-            target = target.to(device)
-            timestamp = timestamp.to(device)
-            cond_mask = cond_mask.to(device)
-            ob_mask = ob_mask.to(device)
-            B,T,N,F = input.shape
+            input_proc = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+            predict_dict, _ = model(input_proc, timestamp, prompt_prefix, cond_mask)
 
+            for var in chosen_vars:
+                idx = scaler.var_indices[var]
+                pred = predict_dict[var].view(B, N, -1, len(idx)).permute(0, 2, 1, 3).contiguous()
+                
+                # 独立物理反归一化，评价真实量级误差
+                pred_phys = scaler.inverse_transform(pred, var)
+                targ_phys = scaler.inverse_transform(target[:, -args.predict_len:, :, idx], var)
+                mask_sub = ob_mask[:, -args.predict_len:, :, idx].bool()
 
-            input = torch.where(cond_mask==0,0,input)
-            input = input.permute(0,2,1,3).contiguous().view(B,N,-1)
+                storage[var]["preds"].append(pred_phys.detach())
+                storage[var]["targs"].append(targ_phys.detach())
+                storage[var]["masks"].append(mask_sub.detach())
 
+        results = {}
+        for var in chosen_vars:
+            all_preds = torch.cat(storage[var]["preds"], 0)
+            all_targs = torch.cat(storage[var]["targs"], 0)
+            all_masks = torch.cat(storage[var]["masks"], 0)
+            
+            mae, rmse, mape, _, _ = cal_metrics(all_preds, all_targs, all_masks)
+            results[var] = (mae, rmse, mape)
+            
+            if save and LOG_DIR:
+                save_path = os.path.join(LOG_DIR, f'test_{var}.npz')
+                np.savez(save_path, targets=all_targs.cpu().numpy(), predicts=all_preds.cpu().numpy(), mask=all_masks.cpu().numpy())
+    return results
 
-            # 新代码
-            predict_dict, _ = model(input, timestamp, prompt_prefix, cond_mask)
-
-            # 从字典中提取 flow
-            predict = predict_dict["flow"]
-            predict = predict.view(B, N, -1, args.output_dim).permute(0, 2, 1, 3).contiguous()
-
-            if args.task != 'prediction':
-                cond_mask = torch.concat((cond_mask,torch.zeros(B,ob_mask.shape[1]-cond_mask.shape[1],N,F).to(device)),dim=1)
-                eval_mask = (ob_mask - cond_mask).bool()[...,:args.output_dim]
-            else:
-                eval_mask = ob_mask[:,-args.predict_len:].bool()[...,:args.output_dim]
-
-            # 同样截取 target 的前 2 个特征存入列表，防止后续算 RMSE 指标时报错
-            targets.append(target[..., :args.output_dim].detach())
-            predicts.append(predict.detach())
-            eval_masks.append(eval_mask.detach())
-
-        targets = torch.concat(targets,dim = 0)
-        predicts = torch.concat(predicts,dim = 0)
-        eval_masks = torch.concat(eval_masks,dim = 0)
-
-        #targets = scaler.inverse_transform(targets)
-        predicts = scaler.inverse_transform(predicts)
-
-        mae_recon, mae_pred = None, None
-        rmse_recon, rmse_pred = None, None
-        mape_recon, mape_pred = None, None
-
-        if args.task in ['all','imputation']:
-            eval_mask = eval_masks[:,:args.sample_len]
-            # mae_recon = MAE_torch(pred=predicts[:,:args.sample_len][eval_mask],true=targets[:,:args.sample_len][eval_mask])
-            # rmse_recon = RMSE_torch(pred=predicts[:,:args.sample_len][eval_mask],true=targets[:,:args.sample_len][eval_mask])
-            # mape_recon = MAPE_torch(pred=predicts[:,:args.sample_len][eval_mask],true=targets[:,:args.sample_len][eval_mask])
-
-            mae_recon, rmse_recon, mape_recon, _,_ = cal_metrics(predicts=predicts[:,:args.sample_len],targets=targets[:,:args.sample_len],eval_mask=eval_mask)
-        
-        if args.task in ['all','prediction']:
-            eval_mask = eval_masks[:,-args.predict_len:]
-            # mae_pred = MAE_torch(pred=predicts[:,-args.predict_len:][eval_mask],true=targets[:,-args.predict_len:][eval_mask])
-            # rmse_pred = RMSE_torch(pred=predicts[:,-args.predict_len:][eval_mask],true=targets[:,-args.predict_len:][eval_mask])
-            # mape_pred = MAPE_torch(pred=predicts[:,-args.predict_len:][eval_mask],true=targets[:,-args.predict_len:][eval_mask])
-
-            # mae_pred, rmse_pred, mape_pred, _,_ = cal_metrics(predicts=predicts[:,:args.sample_len],targets=targets[:,:args.sample_len],eval_mask=eval_mask)
-            mae_pred, rmse_pred, mape_pred, _,_ = cal_metrics(
-                predicts=predicts[:,-args.predict_len:],
-                targets=targets[:,-args.predict_len:],
-                eval_mask=eval_mask
-            )
-
-    if save:
-        np.savez(os.path.join(LOG_DIR,'test.npz'),targets=targets.cpu().numpy(),predicts=predicts.cpu().numpy(),mask=eval_masks.cpu().numpy())
-
-    return mae_recon, rmse_recon, mape_recon, mae_pred, rmse_pred, mape_pred
-
-
-
-def Train(args,mylogger,model,prompt_prefix,scaler):
-
+def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader, test_loader, LOG_DIR):
+    optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode='min', factor=0.5, patience=5)
+    loss_fn = torch.nn.L1Loss()
+    
+    best_loss = 1e9
+    best_model = None
     patience_count = 0
 
-    max_epoch = args.epoch
+    for epoch in range(args.epoch):
+        train_loss = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True)
+        mylogger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
 
-    if args.zero_shot:
-        max_epoch = 0
-
-    lr = args.lr
-    val_epoch = args.val_epoch
-    test_epoch = args.test_epoch
-
-    #optim = torch.optim.AdamW(params=filter(lambda x : x.requires_grad, model.parameters()),lr=lr,weight_decay=args.weight_decay)
-    optim = torch.optim.AdamW([
-        {'params': (p for name, p in model.named_parameters() if ('bias' not in name) and p.requires_grad), 'weight_decay': args.weight_decay},
-        {'params': (p for name, p in model.named_parameters() if ('bias' in name) and p.requires_grad)}
-    ],lr=lr)
-    #scheduler = ExponentialLR(optimizer=optim, gamma=args.lr_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode='min', factor=0.1, patience=10,min_lr=1e-6)
-
-    loss_fn = torch.nn.L1Loss()
-
-    best_loss = 1e9
-    best_model = copy.deepcopy(model.grad_state_dict())
-
-    train_loss_line = {'x':[],'y':[]}
-    val_loss_line = {'x':[],'y':[]}
-
-    for epoch in range(max_epoch):
-
-        train_loss = TrainEpoch(train_loader,model,optim,loss_fn,prompt_prefix,scaler,need_step=True)
-
-        train_loss_line['x'].append(epoch)
-        train_loss_line['y'].append(train_loss)
-
-        mylogger.info(f"epoch {epoch} train_loss:{train_loss}")
-
-        if epoch % val_epoch == 0:
+        if epoch % args.val_epoch == 0:
             with torch.no_grad():
-                val_loss = TrainEpoch(val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False)
-
-            val_loss_line['x'].append(epoch)
-            val_loss_line['y'].append(val_loss)
-
-            if val_loss < best_loss :
-                patience_count = 0
+                val_loss = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False)
+            mylogger.info(f"[Validation] Epoch {epoch} Val Loss: {val_loss:.4f}")
+            scheduler.step(val_loss)
+            
+            if val_loss < best_loss:
                 best_loss = val_loss
                 best_model = copy.deepcopy(model.grad_state_dict())
-            else :
+                patience_count = 0
+            else:
                 patience_count += 1
-            
-            if args.nni:
-                nni.report_intermediate_result(val_loss)
-            mylogger.info(f"[Validation] epoch {epoch} val_loss:{val_loss}")
-            scheduler.step(val_loss)
 
-        if epoch % test_epoch == 0:
-
-            mae_recon, rmse_recon, mape_recon, mae_pred, rmse_pred, mape_pred = TestEpoch(test_loader,model,prompt_prefix,scaler=scaler)
-
-            if args.task in ['all','imputation']:
-            
-                mylogger.info(f"[Test][imputation] epoch {epoch} mae:{mae_recon} rmse:{rmse_recon} mape:{mape_recon}")
-            
-            if args.task in ['all','prediction']:
-            
-                mylogger.info(f"[Test][prediction] epoch {epoch} mae:{mae_pred} rmse:{rmse_pred} mape:{mape_pred}")
-        
-        #scheduler.step()
-        mylogger.info(f"[Scheduler] epoch {epoch} lr:{optim.param_groups[0]['lr']}")
-        
+        if epoch % args.test_epoch == 0:
+            res = TestEpoch(args, test_loader, model, prompt_prefix, scaler)
+            for var, metrics in res.items():
+                mylogger.info(f"   -> [Test][{var}] Epoch {epoch} MAE:{metrics[0]} RMSE:{metrics[1]} MAPE:{metrics[2]}")
 
         if patience_count >= args.patience:
-                mylogger.info('early stop')
-                break
+            mylogger.info('early stop')
+            break
         
-    if args.nni:
-        nni.report_final_result(best_loss)
-
-    
-    model.load_state_dict(best_model,strict=False)
-
-    mae_recon, rmse_recon, mape_recon, mae_pred, rmse_pred, mape_pred = TestEpoch(test_loader,model,prompt_prefix,scaler,save=args.save_result)
-
-    if args.task in ['all','imputation']:
-    
-        mylogger.info(f"[Test][imputation] best model mae:{mae_recon} rmse:{rmse_recon} mape:{mape_recon}")
-    
-    if args.task in ['all','prediction']:
-    
-        mylogger.info(f"[Test][prediction] best model mae:{mae_pred} rmse:{rmse_pred} mape:{mape_pred}")   
-
-    draw_loss_line(train_loss_line,val_loss_line,os.path.join(LOG_DIR,'loss.png'))
-
-
-def getllm(args):
-    if args.model == 'phi2':
-        basemodel = Phi2(args.causal, args.lora, args.ln_grad, args.llm_layers)
-    elif args.model == 'gpt2':
-        basemodel = GPT2(args.causal, args.lora, args.ln_grad, args.llm_layers)
-    elif args.model == 'llama3':
-        basemodel = LLAMA3(args.causal, args.lora, args.ln_grad, args.llm_layers)
-    elif args.model == 'transformer':
-        basemodel = Transformer(args.causal, args.lora, args.ln_grad, args.llm_layers)
-    elif args.model == 'qwen':  # <--- 新增这一行
-        basemodel = QWEN(args.causal, args.lora, args.ln_grad, args.llm_layers) # <--- 新增这一行
-    return basemodel
+    if best_model:
+        model.load_state_dict(best_model, strict=False)
+        final_results = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR)
+        for var, metrics in final_results.items():
+            mylogger.info(f"[Final Best][{var}] MAE:{metrics[0]} RMSE:{metrics[1]} MAPE:{metrics[2]}")
 
 if __name__ == '__main__':
-    
     args = InitArgs()
+    
+    if args.model == 'transformer':
+        basemodel = Transformer(args.causal, args.lora, args.ln_grad, args.llm_layers)
+    else:
+        basemodel = QWEN(args.causal, args.lora, args.ln_grad, args.llm_layers)
+    
+    ocean_data_dir = './data/stdplm_input_025'
+    # 💡 核心修复：强制设置 num_workers=0，禁止 Windows 多进程复制撑爆内存
+    dataloaders = get_ocean_dataloaders(ocean_data_dir, batch_size=args.batch_size, num_workers=0)
+    train_loader, val_loader, test_loader = dataloaders['train'], dataloaders['val'], dataloaders['test']
+    
+    scaler = OceanScaler(f'{ocean_data_dir}/norm_mean.npy', f'{ocean_data_dir}/norm_std.npy', device)
+    node_embeddings = load_ocean_laplacian_embeddings(ocean_data_dir, K=args.trunc_k).to(device)
+
+    safe_time_str = get_time_str().replace(':', '-')
+    LOG_DIR = os.path.join(args.log_root, f'{safe_time_str}_{args.desc}_{random_str()}')
+    check_dir(LOG_DIR, mkdir=True)
+    mylogger = getlogger(os.path.join(LOG_DIR, 'experiments.log'))
 
     output_len = args.predict_len
-    window_size = args.sample_len + args.predict_len
-    if args.task == 'all':
-        output_len += args.sample_len
-    elif args.task == 'imputation':
-        output_len = args.sample_len
-        window_size -= args.predict_len
+    if args.task == 'all': output_len += args.sample_len
+    elif args.task == 'imputation': output_len = args.sample_len
 
-    if args.nni:
-        params = nni.get_next_parameter()
-        args.time_token_dim = params['time_token_dim']
-        args.node_emb_dim = params['node_emb_dim']
-        args.trunc_k = params['trunc_k']
-
-
-   # ---------------- 替换开始 ----------------
-    basemodel = getllm(args)
-
-    ocean_data_dir = './data/stdplm_input_025'
-    
-    import json
-    with open(f'{ocean_data_dir}/meta.json', 'r') as f:
-        meta = json.load(f)
-        
-    node_num = meta['n_nodes']
-    # 动态覆盖命令行参数，保证输入输出维度是我们的 7 个海洋物理特征
-    args.input_dim = meta['n_features']
-    args.output_dim = 2
-
-    dataloaders = get_ocean_dataloaders(ocean_data_dir, batch_size=args.batch_size, num_workers=0)
-    train_loader = dataloaders['train']
-    val_loader   = dataloaders['val']
-    test_loader  = dataloaders['test']
-
-    class OceanScaler:
-        def __init__(self, mean_path, std_path, output_dim):
-            # 取出前 output_dim 个特征，并调整 shape 以适配 (B, T, N, F)
-            self.mean = torch.tensor(np.load(mean_path)[0, 0, :output_dim], dtype=torch.float32).view(1, 1, 1, -1).to(device)
-            self.std = torch.tensor(np.load(std_path)[0, 0, :output_dim], dtype=torch.float32).view(1, 1, 1, -1).to(device)
-        def inverse_transform(self, data):
-            return data * self.std + self.mean
-
-    scaler = OceanScaler(f'{ocean_data_dir}/norm_mean.npy', f'{ocean_data_dir}/norm_std.npy', args.output_dim)
-
-    # 🚨 调用我们在 DataLoader 里写好的稀疏分解函数（极度省内存）
-    node_embeddings = load_ocean_laplacian_embeddings(ocean_data_dir, K=args.trunc_k).to(device)
-    # ---------------- 替换结束 ----------------
-
-    prompt_prefix = None
-    if not args.prompt_prefix is None:
-        prompt_prefix = args.prompt_prefix
-
+    prompt_ids = None
+    if args.prompt_prefix is not None:
         tokenizer = basemodel.gettokenizer()
+        prompt_ids = tokenizer(args.prompt_prefix, return_tensors="pt", return_attention_mask=False)
+        prompt_ids = prompt_ids['input_ids'].to(device).view(-1, 1)
 
-        prompt_prefix = tokenizer(prompt_prefix, 
-                        return_tensors="pt", return_attention_mask=False)
-        prompt_prefix = prompt_prefix['input_ids'].to(device).view(-1,1)#[:-1,:]
+    model = STALLM_MIMO(basemodel=basemodel, sample_len=args.sample_len, output_len=output_len,
+                        input_dim=args.input_dim, output_dim=args.output_dim,
+                        node_emb_dim=args.node_emb_dim, sag_dim=args.sag_dim, sag_tokens=args.sag_tokens,
+                        node_embeddings=node_embeddings, use_node_embedding=args.node_embedding,
+                        use_timetoken=args.time_token, use_sandglassAttn=args.sandglassAttn,
+                        dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim).to(device)
 
-     # 1. 转换安全时间字符串
-    safe_time_str = get_time_str().replace(':', '-')
-
-    # 2. 使用 safe_time_str 创建文件夹名
-    LOG_DIR = os.path.join(args.log_root, f'{safe_time_str}_{args.desc}_{random_str()}')
-
-    check_dir(LOG_DIR, mkdir=True)
-
-    # 3. 创建日志和模型路径
-    logpath = os.path.join(LOG_DIR, f'experiments.log')
-    modelpath = os.path.join(LOG_DIR, f'{safe_time_str}_{args.desc}.pth')
-    mylogger = getlogger(logpath)
-
-    mylogger.info(args)
-
-   # 传入 node_embeddings 替换稠密矩阵参数
-    # 新代码
-    model = STALLM_MIMO(basemodel=basemodel, sample_len= args.sample_len, output_len = output_len, \
-                    input_dim = args.input_dim , output_dim = args.output_dim , \
-                    node_emb_dim=args.node_emb_dim , \
-                    sag_dim = args.sag_dim, sag_tokens = args.sag_tokens, \
-                    node_embeddings = node_embeddings, \
-                    use_node_embedding = args.node_embedding ,use_timetoken= args.time_token, \
-                    use_sandglassAttn = args.sandglassAttn, dropout = args.dropout, trunc_k = args.trunc_k, t_dim = args.t_dim).to(device)
-    if not args.from_pretrained_model is None:
-        model.load(args.from_pretrained_model)
-    
-    if args.zero_shot and args.from_pretrained_model is None :
-        mylogger.info(f'Please specify pretrained model when test zero-shot')
-        exit()
-    
-    #init_model(model,lambda x : x.requires_grad)
-
-    mylogger.info(model)
     total_params, total_trainable_params = model.params_num()
-    mylogger.info(f'total_params:{total_params}    total_trainable_params:{total_trainable_params}')
+    mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')
 
-    mylogger.info(model.grad_state_dict().keys())
-    #mylogger.info(model.state_dict().keys())
-
-    Train(args,mylogger,model,prompt_prefix,scaler)
-
-    model.save(modelpath)
-
-
-
-    
-
-
-
-    
-    
+    Train(args, mylogger, model, prompt_ids, scaler, train_loader, val_loader, test_loader, LOG_DIR)
+    model.save(os.path.join(LOG_DIR, f'{safe_time_str}_{args.desc}.pth'))

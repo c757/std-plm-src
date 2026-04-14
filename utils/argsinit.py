@@ -107,6 +107,9 @@ def InitArgs():
     
     parser.add_argument("--target_strategy" , default='random' ,choices=['random','hybrid'],type=str)
 
+    parser.add_argument('--predict_vars', type=str, default='flow', 
+                        help='Variables to predict, e.g., "flow", "flow,wind" or "flow,wave,wind"')
+
     AddDataArgs(parser)
 
     AddModelArgs(parser)

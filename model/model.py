@@ -127,7 +127,7 @@ class DecodingLayer(nn.Module):
 
 class STALLM_MIMO(nn.Module):
     """
-    全新升级的多输入多输出（MIMO）时空大语言模型架构
+    支持物理分群（流、浪、風）的多輸入多輸出時空架構
     """
     def __init__(self, basemodel, sample_len, output_len,
                  input_dim, output_dim, node_emb_dim, sag_dim, sag_tokens,
@@ -142,106 +142,96 @@ class STALLM_MIMO(nn.Module):
         self.basemodel = basemodel
         self.use_sandglassAttn = use_sandglassAttn
         self.use_node_embedding = use_node_embedding
-        self.sag_tokens = sag_tokens
         
         tim_dim = t_dim * 2
+        
+        # 1. 物理維度定義 (根據 clear.py 的 0,1 | 2,3,4 | 5,6 分佈)
+        self.dims = {'flow': 2, 'wave': 3, 'wind': 2} 
 
-        # 1. 物理要素切片定义
-        self.dims = {'flow': 2, 'wind': 2, 'wave': 1, 'tide': 2} 
-
-        # 2. 通道独立编码器 (Channel-Independent Tokenizers)
+        # 2. 為每一組物理量配置獨立的編碼器
+        from model.model import Node2Token_Independent, TimeEmbedding, NodeEmbedding, DecodingLayer
+        
         self.tokenizer_flow = Node2Token_Independent(sample_len, self.dims['flow'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
+        self.tokenizer_wave = Node2Token_Independent(sample_len, self.dims['wave'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
         self.tokenizer_wind = Node2Token_Independent(sample_len, self.dims['wind'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
         
-        # 3. 独立的空间压缩沙漏与跨模态对齐
+        # 3. 空間壓縮與物理對齊模塊 (以 Flow 為核心，Wind/Wave 為背景)
         if use_sandglassAttn:
             self.sag_flow = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['flow'], dropout)
+            self.sag_wave = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wave'], dropout)
             self.sag_wind = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wind'], dropout)
             self.cross_alignment = CrossModalityAlignment(self.emb_dim, num_heads=4, dropout=dropout)
 
-        # 4. 并行多头解码器
+        # 4. 並行多頭解碼器
         self.head_flow = DecodingLayer(self.emb_dim, self.dims['flow'] * output_len)
+        self.head_wave = DecodingLayer(self.emb_dim, self.dims['wave'] * output_len)
         self.head_wind = DecodingLayer(self.emb_dim, self.dims['wind'] * output_len)
 
-        # ==========================================
-        # 5. 补全缺失的基础组件初始化（修复报错的核心）
-        # ==========================================
+        # 基礎組件
         self.timeembedding = TimeEmbedding(t_dim=t_dim)
-
         if use_node_embedding:
-            self.node_embd_layer = NodeEmbedding(node_embeddings=node_embeddings, node_emb_dim=node_emb_dim, k=trunc_k, dropout=dropout)
+            self.node_embd_layer = NodeEmbedding(node_embeddings, node_emb_dim, trunc_k, dropout)
 
-        self.layer_norm = nn.LayerNorm(self.emb_dim)
-
-    def forward(self, x:torch.FloatTensor, timestamp:torch.Tensor, prompt_prefix:Optional[torch.LongTensor], mask:torch.LongTensor):
+    def forward(self, x, timestamp, prompt_prefix, mask):
         B, N, TF = x.shape 
-        
-        # 1. 解耦输入特征：将 F 维重新剥离出来
         x_reshaped = x.view(B, N, self.sample_len, -1)
         mask_reshaped = mask.view(B, N, self.sample_len, -1)
         
-        # 切片提取特征 (保证各个通道数据的纯净)
-        x_flow = x_reshaped[..., 0:2].contiguous().view(B, N, -1)
-        m_flow = mask_reshaped[..., 0:2].contiguous().view(B, N, -1)
+        # 💡 物理索引精確切片
+        # [0,1] 洋流 | [2,3,4] 海浪 | [5,6] 海風
+        x_f = x_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
+        m_f = mask_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
         
-        x_wind = x_reshaped[..., 2:4].contiguous().view(B, N, -1)
-        m_wind = mask_reshaped[..., 2:4].contiguous().view(B, N, -1)
+        x_wa = x_reshaped[..., [2, 3, 4]].contiguous().view(B, N, -1)
+        m_wa = mask_reshaped[..., [2, 3, 4]].contiguous().view(B, N, -1)
+        
+        x_wi = x_reshaped[..., [5, 6]].contiguous().view(B, N, -1)
+        m_wi = mask_reshaped[..., [5, 6]].contiguous().view(B, N, -1)
 
-        # 获取时间与节点 Embedding
         te = self.timeembedding(timestamp[:, :self.sample_len, :])
         ne = self.node_embd_layer() if self.use_node_embedding else None
 
-        # 2. 独立编码
-        spatial_token_flow = self.tokenizer_flow(x_flow, te, ne, m_flow)
-        spatial_token_wind = self.tokenizer_wind(x_wind, te, ne, m_wind)
+        # 獨立編碼
+        tokens_f = self.tokenizer_flow(x_f, te, ne, m_f)
+        tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa)
+        tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
 
-        # 3. 空间压缩与跨模态对齐 (TimeCMA 核心逻辑)
+        # 物理對齊
         if self.use_sandglassAttn:
-            # 分别压缩至 128 个超节点
-            s_state_flow, _ = self.sag_flow.encode(spatial_token_flow)
-            s_state_wind, _ = self.sag_wind.encode(spatial_token_wind)
+            s_f, _ = self.sag_flow.encode(tokens_f)
+            s_wa, _ = self.sag_wave.encode(tokens_wa)
+            s_wi, _ = self.sag_wind.encode(tokens_wi)
             
-            # 【物理对齐】：以洋流为 Query，以海风为 Key/Value 提取驱动特征
-            aligned_state = self.cross_alignment(core_state=s_state_flow, context_state=s_state_wind)
+            # 融合海浪與海風的背景動力學特徵
+            context = (s_wa + s_wi) / 2
+            aligned = self.cross_alignment(core_state=s_f, context_state=context)
         else:
-            aligned_state = spatial_token_flow # 降级方案
+            aligned = tokens_f
             
-        # 4. 送入大语言模型 (LLM) 进行高维时间逻辑推演
-        # 这里只送入了对齐后的融合状态，极大地节省了序列长度和显存
-        hidden_state = self.basemodel(aligned_state)
+        # LLM 推理
+        hidden = self.basemodel(aligned)
         
-        # 5. 超节点解码回 N 个物理网格点
+        # 解碼
         if self.use_sandglassAttn:
-            decoded_state = self.sag_flow.decode(hidden_state, spatial_token_flow)
+            decoded = self.sag_flow.decode(hidden, tokens_f)
         else:
-            decoded_state = hidden_state
+            decoded = hidden
             
-        decoded_state += spatial_token_flow # 残差
+        decoded += tokens_f # 殘差
         
-        # 6. 多头并行输出预测结果
-        # 这样网络在反向传播时，风和流的梯度不会相互干扰
-        pred_flow = self.head_flow(decoded_state)
-        # pred_wind = self.head_wind(decoded_state)
+        return {
+            "flow": self.head_flow(decoded),
+            "wave": self.head_wave(decoded),
+            "wind": self.head_wind(decoded)
+        }, []
 
-        # 返回一个字典，支持 MIMO 损失函数的独立计算
-        return {"flow": pred_flow}, []
-    def grad_state_dict(self):
-        params_to_save = filter(lambda p: p[1].requires_grad, self.named_parameters())
-        save_list = [p[0] for p in params_to_save]
-        return {name: param.detach() for name, param in self.state_dict().items() if name in save_list}
-        
-    def save(self, path:str):
-        selected_state_dict = self.grad_state_dict()
-        torch.save(selected_state_dict, path)
-    
-    def load(self, path:str):
-        loaded_params = torch.load(path)
-        self.load_state_dict(loaded_params, strict=False)
-    
     def params_num(self):
-        total_params = sum(p.numel() for p in self.parameters())
-        total_params += sum(p.numel() for p in self.buffers())
-        
-        total_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        return total_params, total_trainable_params
+        total = sum(p.numel() for p in self.parameters()) + sum(p.numel() for p in self.buffers())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def grad_state_dict(self):
+        return {n: p.detach() for n, p in self.named_parameters() if p.requires_grad}
+
+    def save(self, path:str): torch.save(self.grad_state_dict(), path)
+    def load(self, path:str): self.load_state_dict(torch.load(path), strict=False)

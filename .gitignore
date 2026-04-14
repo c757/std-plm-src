@@ -9,3 +9,54 @@ logs/
 *.ckpt
 *.npz
 *.npy
+
+# ===== Mac OS =====
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ===== IDEs (JetBrains & VS Code) =====
+.idea/
+.vscode/
+*.iml
+*.iws
+
+# ===== Go (Backend) =====
+/bin/
+/build/
+/dist/
+/out/
+*.exe
+*.test
+*.out
+/vendor/
+
+# ===== Vue / Node (Frontend) =====
+node_modules/
+dist/
+*.log
+.env*
+.env.local
+!.env.example
+
+# ===== AI / Machine Learning (Crucial!) =====
+__pycache__/
+.ipynb_checkpoints/
+*.pth
+*.onnx
+*.h5
+/data/
+.python-version
+
+# ===== Temporary & Logs =====
+*.swp
+*.tmp
+*.log
+*.bak
+
+# ===== Security (Safety first) =====
+*.pem
+*.key
+certs/
