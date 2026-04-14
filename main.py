@@ -6,7 +6,8 @@ import yaml
 import os
 from utils.utils import get_time_str,check_dir,draw_loss_line,draw_mape_node,get_randmask,get_block_mask, cal_shortest_path_length
 from logger import getlogger
-from model.model import STALLM
+# 新代码
+from model.model import STALLM_MIMO
 from model.llm import Phi2,GPT2,LLAMA3,Transformer,QWEN
 #from data.data import load_data
 from utils.metrics import MAE_torch,RMSE_torch,MAPE_torch,MAPE_torch_node,cal_metrics
@@ -61,20 +62,33 @@ def TrainEpoch(loader, model, optim, loss_fn,  prompt_prefix,scaler, need_step :
         input = torch.where(cond_mask==0,0,input)
         input = input.permute(0,2,1,3).contiguous().view(B,N,-1)
 
-        predict,other_loss = model(input,timestamp,prompt_prefix,cond_mask)
+        # 新代码：接收字典输出
+        predict_dict, other_loss = model(input, timestamp, prompt_prefix, cond_mask)
 
-        predict = predict.view(B,N,-1,args.output_dim).permute(0,2,1,3).contiguous()
-        predict = scaler.inverse_transform(predict)
+        # 1. 取出洋流预测结果 (flow)
+        predict_flow = predict_dict["flow"]
+        predict_flow = predict_flow.view(B, N, -1, args.output_dim).permute(0, 2, 1, 3).contiguous()
+        
+        # 2. 反归一化
+        predict_flow = scaler.inverse_transform(predict_flow)
 
-
+        # 3. 构造 eval_mask
         if args.task != 'prediction':
-            cond_mask = torch.concat((cond_mask,torch.zeros(B,ob_mask.shape[1]-cond_mask.shape[1],N,F).to(device)),dim=1)
-            eval_mask = (ob_mask - cond_mask).bool()[...,:args.output_dim]
+            cond_mask = torch.concat((cond_mask, torch.zeros(B, ob_mask.shape[1]-cond_mask.shape[1], N, F).to(device)), dim=1)
+            eval_mask = (ob_mask - cond_mask).bool()[..., :args.output_dim]
         else:
-            eval_mask = ob_mask[:,-args.predict_len:].bool()[...,:args.output_dim]
+            eval_mask = ob_mask[:, -args.predict_len:].bool()[..., :args.output_dim]
 
-        # 截取 target 的前 args.output_dim (也就是 2) 个特征，使其与 predict 维度一致
-        loss = loss_fn(predict[eval_mask], target[..., :args.output_dim][eval_mask])
+        # 4. 匹配 target 维度并计算 Loss (目前只计算 flow 的 Loss)
+        target_flow = target[..., :args.output_dim]
+        
+        loss = loss_fn(predict_flow[eval_mask], target_flow[eval_mask])
+        
+        # 💡 未来扩展提示：如果你接上了风速预测，只需要在这里加上：
+        # predict_wind = predict_dict["wind"].view(...)...
+        # target_wind = target[..., 2:4]
+        # loss_wind = loss_fn(predict_wind[eval_mask_wind], target_wind[eval_mask_wind])
+        # loss = loss + 0.5 * loss_wind
 
         loss_item += loss.item()
         count += 1
@@ -119,9 +133,12 @@ def TestEpoch(loader, model,  prompt_prefix, scaler, save=False):
             input = input.permute(0,2,1,3).contiguous().view(B,N,-1)
 
 
-            predict,_ = model(input,timestamp,prompt_prefix,cond_mask)
+            # 新代码
+            predict_dict, _ = model(input, timestamp, prompt_prefix, cond_mask)
 
-            predict = predict.view(B,N,-1,args.output_dim).permute(0,2,1,3).contiguous()
+            # 从字典中提取 flow
+            predict = predict_dict["flow"]
+            predict = predict.view(B, N, -1, args.output_dim).permute(0, 2, 1, 3).contiguous()
 
             if args.task != 'prediction':
                 cond_mask = torch.concat((cond_mask,torch.zeros(B,ob_mask.shape[1]-cond_mask.shape[1],N,F).to(device)),dim=1)
@@ -360,14 +377,14 @@ if __name__ == '__main__':
     mylogger.info(args)
 
    # 传入 node_embeddings 替换稠密矩阵参数
-    model = STALLM(basemodel=basemodel, sample_len= args.sample_len, output_len = output_len, \
+    # 新代码
+    model = STALLM_MIMO(basemodel=basemodel, sample_len= args.sample_len, output_len = output_len, \
                     input_dim = args.input_dim , output_dim = args.output_dim , \
-                     node_emb_dim=args.node_emb_dim , \
+                    node_emb_dim=args.node_emb_dim , \
                     sag_dim = args.sag_dim, sag_tokens = args.sag_tokens, \
-                     node_embeddings = node_embeddings, \
+                    node_embeddings = node_embeddings, \
                     use_node_embedding = args.node_embedding ,use_timetoken= args.time_token, \
-                    use_sandglassAttn = args.sandglassAttn, dropout = args.dropout, trunc_k = args.trunc_k, t_dim = args.t_dim, wo_conloss=True).to(device)
-    
+                    use_sandglassAttn = args.sandglassAttn, dropout = args.dropout, trunc_k = args.trunc_k, t_dim = args.t_dim).to(device)
     if not args.from_pretrained_model is None:
         model.load(args.from_pretrained_model)
     

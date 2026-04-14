@@ -3,30 +3,9 @@ import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional, Tuple, Union
 from utils.utils import norm_Adj, lap_eig, topological_sort
-from model.sandglassAttn import SAG
+from model.sandglassAttn import SAG, CrossModalityAlignment
 import numpy as np
 from model.position import PositionalEncoding
-
-
-class DecodingLayer(nn.Module):
-
-    def __init__(self, input_dim ,emb_dim, output_dim):
-        super().__init__()
-
-        hidden_size = (emb_dim+output_dim)*2//3
-        self.fc = nn.Sequential(
-            nn.Linear(emb_dim, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_dim),
-        )
-        #nn.Linear(in_features=input_dim,out_features=output_dim)
-        
-    def forward(self, llm_hidden):
-
-        out = self.fc(llm_hidden)
-
-        return out
-
 class TimeEmbedding(nn.Module):
 
     def __init__(self,t_dim):
@@ -93,247 +72,176 @@ class Time2Token(nn.Module):
         )        
 
         self.ln = nn.LayerNorm(emb_dim)
+# 以下直接展示最重要的 MIMO 改造部分：
 
-    def forward(self,x,te,mask):
-        # te(B,T,tim_dim)
-
-        B,N,TF = x.shape
-
-        x = x.view(B,N,self.sample_len,-1) #B,N,T,F
-        x = torch.concat((x,mask.view(B,N,self.sample_len,-1)),dim=-1)
-        x = x.mean(dim=1) #B,T,F
-
-        state = x.view(B,1,-1)
-        state = torch.concat((state,te[:,-1:,:]),dim=-1)#(B,1,TF+tim_dim)
-        state = self.fc_state(state)
-
-        grad = (x[:,1:,:] - x[:,:-1,:]).view(B,1,-1)#(B,1,(T-1)F)
-        grad = torch.concat((grad,te[:,-1:,:]),dim=-1)#(B,1,(T-1)F+tim_dim)
-        grad = self.fc_grad(grad)
-
-        out = torch.concat((state,grad),dim=1)
-
-        out = self.ln(out)
-
-        return out
-
-
-class Node2Token(nn.Module):
-    def __init__(self,sample_len, features, node_emb_dim, emb_dim, tim_dim, dropout, use_node_embedding):
+class Node2Token_Independent(nn.Module):
+    """
+    为单一物理要素专门定制的 Tokenizer，保证通道独立性（Channel Independence）
+    """
+    def __init__(self, sample_len, feature_dim, node_emb_dim, emb_dim, tim_dim, dropout, use_node_embedding):
         super().__init__()
-
-        in_features = sample_len*features*2
-        
+        in_features = sample_len * feature_dim * 2  # 包含 mask 拼接
         self.use_node_embedding = use_node_embedding
-
-        state_features =  tim_dim
+        state_features = tim_dim
         if use_node_embedding:
             state_features += node_emb_dim
 
-        self.fc1 = nn.Sequential(
-            nn.Linear(in_features, emb_dim),
-        )
+        self.fc1 = nn.Sequential(nn.Linear(in_features, emb_dim))
         
-        hidden_size = node_emb_dim
         self.state_fc = nn.Sequential(
-            nn.Linear(state_features, hidden_size),
+            nn.Linear(state_features, node_emb_dim),
             nn.ReLU(),
-            nn.Linear(hidden_size,emb_dim),
+            nn.Linear(node_emb_dim, emb_dim),
         )
-
-        self.mask_token = nn.Linear(in_features=sample_len*features,out_features=emb_dim)
-
+        self.mask_token = nn.Linear(in_features=sample_len*feature_dim, out_features=emb_dim)
         self.ln = nn.LayerNorm(emb_dim)
 
-    def forward(self,x,te,ne,mask):
-        #te(B,T,tim_dim)  ne(N,node_emb_dim) mask(B,T,N,F)
-        B,N,TF = x.shape
+    def forward(self, x, te, ne, mask):
+        B, N, TF = x.shape
+        mask = mask.contiguous().view(B, N, -1) 
+        x = torch.concat((x, mask), dim=-1)
 
-        mask = mask.permute(0,2,1,3).contiguous().view(B,N,-1) #(B,N,TF)
-        x = torch.concat((x,mask),dim=-1)
-
-        state = te[:,-1:,:].repeat(1,N,1)
+        state = te[:, -1:, :].repeat(1, N, 1)
         if self.use_node_embedding:
-            ne = torch.unsqueeze(ne,dim=0).repeat(B,1,1)
-            state = torch.concat((state,ne),dim=-1)
+            ne = torch.unsqueeze(ne, dim=0).repeat(B, 1, 1)
+            state = torch.concat((state, ne), dim=-1)
         state = self.state_fc(state)
 
-        x = self.fc1(x) #B,N,D
-        x += self.mask_token(mask) #test
-
-        out = state + x
-
-        out = self.ln(out)
-
+        x = self.fc1(x)
+        x += self.mask_token(mask)
+        out = self.ln(state + x)
         return out
 
+class DecodingLayer(nn.Module):
+    def __init__(self, emb_dim, output_dim):
+        super().__init__()
+        hidden_size = (emb_dim + output_dim) * 2 // 3
+        self.fc = nn.Sequential(
+            nn.Linear(emb_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_dim),
+        )
+    def forward(self, llm_hidden):
+        return self.fc(llm_hidden)
 
-class STALLM(nn.Module):
-    # 将 adj_mx, dis_mx 替换为 node_embeddings
+
+class STALLM_MIMO(nn.Module):
+    """
+    全新升级的多输入多输出（MIMO）时空大语言模型架构
+    """
     def __init__(self, basemodel, sample_len, output_len,
                  input_dim, output_dim, node_emb_dim, sag_dim, sag_tokens,
                  node_embeddings=None, use_node_embedding=True,
                  use_timetoken=True, use_sandglassAttn=True,
-                 dropout=0, trunc_k=16, t_dim=64, wo_conloss=True): # 强制 wo_conloss 默认为 True
+                 dropout=0, trunc_k=16, t_dim=64): 
         super().__init__()
-
-        # 🚨 必须关闭：6万节点无法进行拓扑排序
-        self.topological_sort_node = False
-
-        tim_dim = t_dim * 2 # hour, week
-
-        # 🚨 删除了原有的 self.setadj(adj_mx, dis_mx)
-
-        self.output_dim = output_dim
-        self.input_dim = input_dim
-        self.emb_dim = basemodel.emb_dim
-        self.basemodel = basemodel
+        
         self.sample_len = sample_len
         self.output_len = output_len
-        self.sag_tokens = sag_tokens
-
+        self.emb_dim = basemodel.emb_dim
+        self.basemodel = basemodel
         self.use_sandglassAttn = use_sandglassAttn
+        self.use_node_embedding = use_node_embedding
+        self.sag_tokens = sag_tokens
+        
+        tim_dim = t_dim * 2
+
+        # 1. 物理要素切片定义
+        self.dims = {'flow': 2, 'wind': 2, 'wave': 1, 'tide': 2} 
+
+        # 2. 通道独立编码器 (Channel-Independent Tokenizers)
+        self.tokenizer_flow = Node2Token_Independent(sample_len, self.dims['flow'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
+        self.tokenizer_wind = Node2Token_Independent(sample_len, self.dims['wind'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
+        
+        # 3. 独立的空间压缩沙漏与跨模态对齐
         if use_sandglassAttn:
-            # 🚨 必须关闭：约束损失计算涉及 63200x63200 矩阵乘法，会导致显存瞬间溢出
-            self.wo_conloss = True
-            self.sandglassAttn = SAG(sag_dim=sag_dim, sag_tokens=sag_tokens, emb_dim=self.emb_dim, sample_len=sample_len, features=input_dim, dropout=dropout)
+            self.sag_flow = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['flow'], dropout)
+            self.sag_wind = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wind'], dropout)
+            self.cross_alignment = CrossModalityAlignment(self.emb_dim, num_heads=4, dropout=dropout)
 
-        self.spatialTokenizer = Node2Token(sample_len=sample_len, features=input_dim, node_emb_dim=node_emb_dim,
-                                            emb_dim=self.emb_dim,
-                                            tim_dim=tim_dim, dropout=dropout, use_node_embedding=use_node_embedding)
+        # 4. 并行多头解码器
+        self.head_flow = DecodingLayer(self.emb_dim, self.dims['flow'] * output_len)
+        self.head_wind = DecodingLayer(self.emb_dim, self.dims['wind'] * output_len)
 
-        self.out_mlp = DecodingLayer(input_dim=output_dim*sample_len,
-                                     emb_dim=self.emb_dim,
-                                     output_dim=output_dim*output_len)
-
+        # ==========================================
+        # 5. 补全缺失的基础组件初始化（修复报错的核心）
+        # ==========================================
         self.timeembedding = TimeEmbedding(t_dim=t_dim)
 
-        self.use_node_embedding = use_node_embedding
         if use_node_embedding:
-            # 🚨 改为传入预先计算好的 node_embeddings
             self.node_embd_layer = NodeEmbedding(node_embeddings=node_embeddings, node_emb_dim=node_emb_dim, k=trunc_k, dropout=dropout)
 
-        self.use_timetoken = use_timetoken
-        if use_timetoken:
-            self.timeTokenizer = Time2Token(sample_len=sample_len, features=input_dim,
-                                            emb_dim=self.emb_dim,
-                                            tim_dim=tim_dim, dropout=dropout)
-        
         self.layer_norm = nn.LayerNorm(self.emb_dim)
 
-    # 往下保留原有的 forward、save 等方法...
-    # 🚨 滑到最后，把 def setadj(self, adj_mx, dis_mx): 整个函数彻底删掉！
+    def forward(self, x:torch.FloatTensor, timestamp:torch.Tensor, prompt_prefix:Optional[torch.LongTensor], mask:torch.LongTensor):
+        B, N, TF = x.shape 
+        
+        # 1. 解耦输入特征：将 F 维重新剥离出来
+        x_reshaped = x.view(B, N, self.sample_len, -1)
+        mask_reshaped = mask.view(B, N, self.sample_len, -1)
+        
+        # 切片提取特征 (保证各个通道数据的纯净)
+        x_flow = x_reshaped[..., 0:2].contiguous().view(B, N, -1)
+        m_flow = mask_reshaped[..., 0:2].contiguous().view(B, N, -1)
+        
+        x_wind = x_reshaped[..., 2:4].contiguous().view(B, N, -1)
+        m_wind = mask_reshaped[..., 2:4].contiguous().view(B, N, -1)
 
-    def forward(self,x:torch.FloatTensor,timestamp:torch.Tensor,prompt_prefix:Optional[torch.LongTensor],mask:torch.LongTensor):
-        other_loss = []
+        # 获取时间与节点 Embedding
+        te = self.timeembedding(timestamp[:, :self.sample_len, :])
+        ne = self.node_embd_layer() if self.use_node_embedding else None
 
-        # timestamp (B,T,4)
-        timestamp = timestamp[:,:self.sample_len,:]
+        # 2. 独立编码
+        spatial_token_flow = self.tokenizer_flow(x_flow, te, ne, m_flow)
+        spatial_token_wind = self.tokenizer_wind(x_wind, te, ne, m_wind)
 
-        B,N,TF = x.shape #(Batch,N,T*features)
-        # emb of time
-        te = self.timeembedding(timestamp) #(B,T,tim_dim)
-        # emb of nodes
-        if self.use_node_embedding:
-            ne = self.node_embd_layer()
+        # 3. 空间压缩与跨模态对齐 (TimeCMA 核心逻辑)
+        if self.use_sandglassAttn:
+            # 分别压缩至 128 个超节点
+            s_state_flow, _ = self.sag_flow.encode(spatial_token_flow)
+            s_state_wind, _ = self.sag_wind.encode(spatial_token_wind)
+            
+            # 【物理对齐】：以洋流为 Query，以海风为 Key/Value 提取驱动特征
+            aligned_state = self.cross_alignment(core_state=s_state_flow, context_state=s_state_wind)
         else:
-            ne = None
-
-        # spatial token
-        spatial_token = self.spatialTokenizer(x,te,ne,mask)
-        if self.topological_sort_node:
-            spatial_token = spatial_token[:,self.node_order,:]
-
-        # spatial -> sandglassAttn
-        st_embedding = spatial_token
-        s_num = N
+            aligned_state = spatial_token_flow # 降级方案
+            
+        # 4. 送入大语言模型 (LLM) 进行高维时间逻辑推演
+        # 这里只送入了对齐后的融合状态，极大地节省了序列长度和显存
+        hidden_state = self.basemodel(aligned_state)
+        
+        # 5. 超节点解码回 N 个物理网格点
         if self.use_sandglassAttn:
-            s_num = self.sag_tokens
-            st_embedding,attn_weights = self.sandglassAttn.encode(st_embedding) #(B,N',D) #attn_weights(B,N',N)
-            if not self.wo_conloss:
-                scale = attn_weights.sum(dim=1)#(B,N)
+            decoded_state = self.sag_flow.decode(hidden_state, spatial_token_flow)
+        else:
+            decoded_state = hidden_state
+            
+        decoded_state += spatial_token_flow # 残差
+        
+        # 6. 多头并行输出预测结果
+        # 这样网络在反向传播时，风和流的梯度不会相互干扰
+        pred_flow = self.head_flow(decoded_state)
+        # pred_wind = self.head_wind(decoded_state)
 
-                sag_score = torch.einsum('bmn,bhn->bhm',self.adj_mx[None,:,:],attn_weights)
-                other_loss.append(-((sag_score*attn_weights-attn_weights*attn_weights)).sum(dim=2).mean()*10)
-
-                Dirichlet = torch.distributions.dirichlet.Dirichlet(self.alpha)
-                other_loss.append(-Dirichlet.log_prob(torch.softmax(scale,dim=-1)).sum())
-
-        if self.use_timetoken:
-            time_tokens = self.timeTokenizer(x,te,mask)
-            time_tokens_idx = st_embedding.shape[1]
-            st_embedding = torch.concat([time_tokens,st_embedding],dim=1)
-
-        if prompt_prefix is not None:
-            prompt_len,_ = prompt_prefix.shape
-            prompt_embedding = self.basemodel.getembedding(prompt_prefix).view(1,prompt_len,-1)
-            prompt_embedding = prompt_embedding.repeat(B,1,1)
-            st_embedding = torch.concat([prompt_embedding,st_embedding],dim=1)
-
-        hidden_state = st_embedding
-
-        hidden_state = self.basemodel(hidden_state)
-        s_state = hidden_state[:,-s_num:,:]
-
-
-        if self.use_sandglassAttn:
-            s_state = self.sandglassAttn.decode(s_state,spatial_token) 
-        s_state += spatial_token
-
-        if self.topological_sort_node:
-            s_state = s_state[:,self.node_order_rev,:]
-
-        if self.use_timetoken:
-            t_state = hidden_state[:,-time_tokens_idx-1:-time_tokens_idx,:]
-            t_state += time_tokens[:,-1:,:]
-
-            s_state += t_state
-
-        s_state = self.layer_norm(s_state)
-
-        out = self.out_mlp(s_state)
-
-        return out, other_loss
-
+        # 返回一个字典，支持 MIMO 损失函数的独立计算
+        return {"flow": pred_flow}, []
     def grad_state_dict(self):
         params_to_save = filter(lambda p: p[1].requires_grad, self.named_parameters())
         save_list = [p[0] for p in params_to_save]
-        return  {name: param.detach() for name, param in self.state_dict().items() if name in save_list}
+        return {name: param.detach() for name, param in self.state_dict().items() if name in save_list}
         
-    
     def save(self, path:str):
-        
         selected_state_dict = self.grad_state_dict()
         torch.save(selected_state_dict, path)
     
     def load(self, path:str):
-
         loaded_params = torch.load(path)
-        self.load_state_dict(loaded_params,strict=False)
+        self.load_state_dict(loaded_params, strict=False)
     
     def params_num(self):
         total_params = sum(p.numel() for p in self.parameters())
         total_params += sum(p.numel() for p in self.buffers())
         
-        total_trainable_params = sum(
-            p.numel() for p in self.parameters() if p.requires_grad)
+        total_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
         return total_params, total_trainable_params
-
-    
-
-# if __name__ == "__main__":
-    
-    # model = Phi4ST_GNN(8)
-
-    # data = torch.rand(1,12,8)
-
-    # print(model(x=data))
-
-    # optimizer = torch.optim.Adam(params=filter(lambda x: x.requires_grad ,model.parameters()),lr=1e-3)
-
-    # model.save('test.pth')
-
-    # model.load('test.pth')
-
-

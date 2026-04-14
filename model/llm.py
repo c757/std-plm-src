@@ -281,8 +281,13 @@ class QWEN(BaseModel):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     def forward(self, x:torch.FloatTensor, attention_mask=None):
+        # 1. 强制将输入数据转换为与大模型权重一致的半精度 (FP16)
+        x = x.to(self.llm.dtype)
+        
         out = self.llm(inputs_embeds=x, attention_mask=attention_mask, output_hidden_states=True).hidden_states[-1]
-        return out
+        
+        # 2. 输出时将其转回单精度 (FP32)，防止后续的并行解码器 (DecodingLayer) 报错
+        return out.to(torch.float32)
 
     def getembedding(self, x:torch.FloatTensor):
         return self.llm.model.embed_tokens(x)
