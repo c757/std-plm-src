@@ -145,8 +145,8 @@ class STALLM_MIMO(nn.Module):
         
         tim_dim = t_dim * 2
         
-        # 1. 物理維度定義 (根據 clear.py 的 0,1 | 2,3,4 | 5,6 分佈)
-        self.dims = {'flow': 2, 'wave': 3, 'wind': 2} 
+        # 1. 物理維度定義 (根據 clear.py 的 0,1 | 2,3,4,5 | 6,7 分佈)
+        self.dims = {'flow': 2, 'wave': 4, 'wind': 2} 
 
         # 2. 為每一組物理量配置獨立的編碼器
         from model.model import Node2Token_Independent, TimeEmbedding, NodeEmbedding, DecodingLayer
@@ -177,16 +177,17 @@ class STALLM_MIMO(nn.Module):
         x_reshaped = x.view(B, N, self.sample_len, -1)
         mask_reshaped = mask.view(B, N, self.sample_len, -1)
         
-        # 💡 物理索引精確切片
-        # [0,1] 洋流 | [2,3,4] 海浪 | [5,6] 海風
+        # 💡 物理索引精確切片 (对齐 8 维新数据)
         x_f = x_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
         m_f = mask_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
         
-        x_wa = x_reshaped[..., [2, 3, 4]].contiguous().view(B, N, -1)
-        m_wa = mask_reshaped[..., [2, 3, 4]].contiguous().view(B, N, -1)
+        # 波浪增加第 5 维 (包含 sin 和 cos)
+        x_wa = x_reshaped[..., [2, 3, 4, 5]].contiguous().view(B, N, -1)
+        m_wa = mask_reshaped[..., [2, 3, 4, 5]].contiguous().view(B, N, -1)
         
-        x_wi = x_reshaped[..., [5, 6]].contiguous().view(B, N, -1)
-        m_wi = mask_reshaped[..., [5, 6]].contiguous().view(B, N, -1)
+        # 海风被挤到了第 6, 7 维
+        x_wi = x_reshaped[..., [6, 7]].contiguous().view(B, N, -1)
+        m_wi = mask_reshaped[..., [6, 7]].contiguous().view(B, N, -1)
 
         te = self.timeembedding(timestamp[:, :self.sample_len, :])
         ne = self.node_embd_layer() if self.use_node_embedding else None

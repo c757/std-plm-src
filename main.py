@@ -38,8 +38,8 @@ class OceanScaler:
         self.std = torch.tensor(np.load(std_path).flatten(), dtype=torch.float32).to(device)
         self.var_indices = {
             'flow': [0, 1],
-            'wave': [2, 3, 4],
-            'wind': [5, 6]
+            'wave': [2, 3, 4, 5], # 现在 wave 有 4 个分量：波高、波向sin、波向cos、周期
+            'wind': [6, 7]        # 风速被挤到了最后两位 6, 7
         }
 
     def inverse_transform(self, data, var_name):
