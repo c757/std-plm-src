@@ -1,6 +1,8 @@
 from typing import Iterator, Mapping
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Any, Dict, Optional, Tuple, Union
 from utils.utils import norm_Adj, lap_eig, topological_sort
 from model.sandglassAttn import SAG, CrossModalityAlignment
@@ -11,9 +13,25 @@ class TimeEmbedding(nn.Module):
     def __init__(self,t_dim):
         super().__init__()
 
-        #self.hour_embedding = nn.Embedding(num_embeddings=24,embedding_dim=t_dim)
-        self.day_embedding = nn.Embedding(num_embeddings=288,embedding_dim=t_dim)
-        self.week_embedding = nn.Embedding(num_embeddings=7,embedding_dim=t_dim)
+        # 周期函数时间编码（重点覆盖潮汐周期）
+        # M2 主半日潮: 12.42h；同时加入日/周相关周期提升稳健性
+        period_minutes = [
+            12.42 * 60,  # M2
+            12.00 * 60,  # S2
+            23.93 * 60,  # K1
+            25.82 * 60,  # O1
+            24.00 * 60,  # solar-day
+            7 * 24 * 60  # week
+        ]
+        self.register_buffer("period_minutes", torch.tensor(period_minutes, dtype=torch.float32))
+        in_dim = len(period_minutes) * 2
+
+        self.trig_proj = nn.Sequential(
+            nn.Linear(in_dim, t_dim * 2),
+            nn.GELU(),
+            nn.Linear(t_dim * 2, t_dim * 2),
+        )
+        self.ln = nn.LayerNorm(t_dim * 2)
 
     def forward(self,TE):
 
@@ -25,11 +43,13 @@ class TimeEmbedding(nn.Module):
         hour = (TE[...,3].to(torch.long) % 24).view(B*T,-1)
         minute = (TE[...,4].to(torch.long) % 60).view(B*T,-1)
 
-        DE = self.day_embedding((hour*60+minute)//5)
-        #HE = self.hour_embedding(hour)
-        WE = self.week_embedding(week)
+        # 以“周内分钟”构造连续时间，相比固定 slot 更易建模潮汐相位漂移
+        t_minutes = (week * 24 * 60 + hour * 60 + minute).float()  # (B*T, 1)
+        period = self.period_minutes.view(1, -1).to(t_minutes.device)  # (1, P)
+        angle = 2 * math.pi * t_minutes / period  # (B*T, P)
 
-        te = torch.concat((DE,WE),dim=-1).view(B,T,-1)
+        trig = torch.concat((torch.sin(angle), torch.cos(angle)), dim=-1)  # (B*T, 2P)
+        te = self.ln(self.trig_proj(trig)).view(B, T, -1)
 
         return te
 
@@ -125,6 +145,70 @@ class DecodingLayer(nn.Module):
         return self.fc(llm_hidden)
 
 
+class DynamicTriModalFusion(nn.Module):
+    """
+    三模态动态融合：每个变量都用自身作为主干，并按余弦相似度动态吸收另外两种变量信息。
+    输出保持变量独立（flow/wave/wind 各有各的融合结果），同时显式建模相互影响。
+    """
+    def __init__(self, emb_dim, dropout=0.0, temperature=0.5, mode="cosine"):
+        super().__init__()
+        if mode not in ("cosine", "qkv"):
+            raise ValueError(f"Unsupported fusion mode: {mode}. Expected 'cosine' or 'qkv'.")
+
+        self.mode = mode
+        self.temperature = temperature
+        self.scale = emb_dim ** -0.5
+        self.dropout = nn.Dropout(dropout)
+        self.proj = nn.ModuleList([nn.Linear(emb_dim, emb_dim) for _ in range(3)])
+        self.ln = nn.ModuleList([nn.LayerNorm(emb_dim) for _ in range(3)])
+
+        # QKV 融合专用投影（按“目标变量”分别建模）
+        self.q_proj = nn.ModuleList([nn.Linear(emb_dim, emb_dim) for _ in range(3)])
+        self.k_proj = nn.ModuleList([nn.Linear(emb_dim, emb_dim) for _ in range(3)])
+        self.v_proj = nn.ModuleList([nn.Linear(emb_dim, emb_dim) for _ in range(3)])
+
+    def _fuse_one(self, core, all_states, proj, ln):
+        # core: (B, S, D), all_states: list[(B, S, D)]
+        sims = [F.cosine_similarity(core, s, dim=-1).unsqueeze(-1) for s in all_states]  # 3 x (B, S, 1)
+        sims = torch.concat(sims, dim=-1) / self.temperature                                # (B, S, 3)
+        weights = torch.softmax(sims, dim=-1)
+
+        stacked = torch.stack(all_states, dim=-2)                                            # (B, S, 3, D)
+        fused = torch.sum(weights.unsqueeze(-1) * stacked, dim=-2)                           # (B, S, D)
+        out = ln(core + self.dropout(proj(fused)))
+        return out, weights
+
+    def _fuse_one_qkv(self, core, all_states, idx):
+        # core: (B, S, D), all_states: list[(B, S, D)]
+        stacked = torch.stack(all_states, dim=-2)  # (B, S, 3, D)
+
+        q = self.q_proj[idx](core).unsqueeze(-2)   # (B, S, 1, D)
+        k = self.k_proj[idx](stacked)              # (B, S, 3, D)
+        v = self.v_proj[idx](stacked)              # (B, S, 3, D)
+
+        scores = torch.sum(q * k, dim=-1) * self.scale
+        weights = torch.softmax(scores, dim=-1)    # (B, S, 3)
+        fused = torch.sum(weights.unsqueeze(-1) * v, dim=-2)  # (B, S, D)
+
+        out = self.ln[idx](core + self.dropout(self.proj[idx](fused)))
+        return out, weights
+
+    def forward(self, s_flow, s_wave, s_wind):
+        all_states = [s_flow, s_wave, s_wind]
+
+        if self.mode == "qkv":
+            flow_out, w_flow = self._fuse_one_qkv(s_flow, all_states, idx=0)
+            wave_out, w_wave = self._fuse_one_qkv(s_wave, all_states, idx=1)
+            wind_out, w_wind = self._fuse_one_qkv(s_wind, all_states, idx=2)
+        else:
+            flow_out, w_flow = self._fuse_one(s_flow, all_states, self.proj[0], self.ln[0])
+            wave_out, w_wave = self._fuse_one(s_wave, all_states, self.proj[1], self.ln[1])
+            wind_out, w_wind = self._fuse_one(s_wind, all_states, self.proj[2], self.ln[2])
+
+        weight_dict = {"flow": w_flow, "wave": w_wave, "wind": w_wind}
+        return (flow_out, wave_out, wind_out), weight_dict
+
+
 class STALLM_MIMO(nn.Module):
     """
     支持物理分群（流、浪、風）的多輸入多輸出時空架構
@@ -133,7 +217,7 @@ class STALLM_MIMO(nn.Module):
                  input_dim, output_dim, node_emb_dim, sag_dim, sag_tokens,
                  node_embeddings=None, use_node_embedding=True,
                  use_timetoken=True, use_sandglassAttn=True,
-                 dropout=0, trunc_k=16, t_dim=64): 
+                 dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine"): 
         super().__init__()
         
         self.sample_len = sample_len
@@ -142,6 +226,7 @@ class STALLM_MIMO(nn.Module):
         self.basemodel = basemodel
         self.use_sandglassAttn = use_sandglassAttn
         self.use_node_embedding = use_node_embedding
+        self.fusion_mode = fusion_mode
         
         tim_dim = t_dim * 2
         
@@ -160,7 +245,9 @@ class STALLM_MIMO(nn.Module):
             self.sag_flow = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['flow'], dropout)
             self.sag_wave = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wave'], dropout)
             self.sag_wind = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wind'], dropout)
-            self.cross_alignment = CrossModalityAlignment(self.emb_dim, num_heads=4, dropout=dropout)
+
+        # 新增：三模态动态融合（无论是否启用 SAG，都可在当前 token 空间融合）
+        self.dynamic_fusion = DynamicTriModalFusion(self.emb_dim, dropout=dropout, mode=fusion_mode)
 
         # 4. 並行多頭解碼器
         self.head_flow = DecodingLayer(self.emb_dim, self.dims['flow'] * output_len)
@@ -197,40 +284,48 @@ class STALLM_MIMO(nn.Module):
         tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa)
         tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
 
-        # 物理對齊
+        # 动态融合 + 独立后半程
         if self.use_sandglassAttn:
             s_f, _ = self.sag_flow.encode(tokens_f)
             s_wa, _ = self.sag_wave.encode(tokens_wa)
             s_wi, _ = self.sag_wind.encode(tokens_wi)
-            
-            # 融合海浪與海風的背景動力學特徵
-            context = (s_wa + s_wi) / 2
-            aligned = self.cross_alignment(core_state=s_f, context_state=context)
+
+            # 每个变量都进行“自己 + 动态加权其他变量”融合
+            (aligned_f, aligned_wa, aligned_wi), weight_dict = self.dynamic_fusion(s_f, s_wa, s_wi)
+
+            # 每个变量都独立进入 PLM
+            hidden_f = self.basemodel(aligned_f)
+            hidden_wa = self.basemodel(aligned_wa)
+            hidden_wi = self.basemodel(aligned_wi)
+
+            # 每个变量都用自己的解码器 + 残差
+            decoded_f = self.sag_flow.decode(hidden_f, tokens_f) + tokens_f
+            decoded_wa = self.sag_wave.decode(hidden_wa, tokens_wa) + tokens_wa
+            decoded_wi = self.sag_wind.decode(hidden_wi, tokens_wi) + tokens_wi
         else:
-            aligned = tokens_f
-            
-        # LLM 推理
-        hidden = self.basemodel(aligned)
-        
-        # 解碼
-        if self.use_sandglassAttn:
-            decoded = self.sag_flow.decode(hidden, tokens_f)
-        else:
-            decoded = hidden
-            
-        decoded += tokens_f # 殘差
+            (aligned_f, aligned_wa, aligned_wi), weight_dict = self.dynamic_fusion(tokens_f, tokens_wa, tokens_wi)
+
+            hidden_f = self.basemodel(aligned_f)
+            hidden_wa = self.basemodel(aligned_wa)
+            hidden_wi = self.basemodel(aligned_wi)
+
+            # 无 SAG 时直接残差
+            decoded_f = hidden_f + tokens_f
+            decoded_wa = hidden_wa + tokens_wa
+            decoded_wi = hidden_wi + tokens_wi
         
         return {
-            "flow": self.head_flow(decoded),
-            "wave": self.head_wave(decoded),
-            "wind": self.head_wind(decoded)
-        }, []
+            "flow": self.head_flow(decoded_f),
+            "wave": self.head_wave(decoded_wa),
+            "wind": self.head_wind(decoded_wi)
+        }, [], {"fusion_weights": weight_dict}
 
     def params_num(self):
         total = sum(p.numel() for p in self.parameters()) + sum(p.numel() for p in self.buffers())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total, trainable
-
+    
+    
     def grad_state_dict(self):
         return {n: p.detach() for n, p in self.named_parameters() if p.requires_grad}
 

@@ -32,6 +32,81 @@ print(f"当前使用的计算设备: {device}")
 
 random_str = lambda : ''.join(random.sample(string.ascii_letters + string.digits, 6))
 
+COMPONENT_NAMES = {
+    'flow': ['flow_u', 'flow_v'],
+    'wave': ['wave_h', 'wave_dir_sin', 'wave_dir_cos', 'wave_period'],
+    'wind': ['wind_u', 'wind_v'],
+}
+
+MODALITY_ORDER = ['flow', 'wave', 'wind']
+
+
+def _fmt_float(v, ndigits=4):
+    try:
+        if v is None:
+            return 'nan'
+        return f"{float(v):.{ndigits}f}"
+    except Exception:
+        return 'nan'
+
+
+def _format_named_metric(values, var_name, metric_name):
+    names = COMPONENT_NAMES.get(var_name, [f"{var_name}_{i}" for i in range(len(values))])
+    if len(names) < len(values):
+        names += [f"{var_name}_{i}" for i in range(len(names), len(values))]
+    pairs = [f"{names[i]}={_fmt_float(values[i])}" for i in range(len(values))]
+    return f"{metric_name}[{', '.join(pairs)}]"
+
+
+def _init_fusion_stats():
+    return {tgt: {src: 0.0 for src in MODALITY_ORDER} for tgt in MODALITY_ORDER}, 0
+
+
+def _accumulate_fusion_stats(stats, weight_dict):
+    stat_map, count = stats
+    if not weight_dict:
+        return stat_map, count
+
+    for tgt in MODALITY_ORDER:
+        w = weight_dict.get(tgt, None)
+        if w is None:
+            continue
+        # w: (B, S, 3)
+        w_mean = w.detach().mean(dim=(0, 1)).cpu().tolist()
+        for i, src in enumerate(MODALITY_ORDER):
+            stat_map[tgt][src] += float(w_mean[i])
+    return stat_map, count + 1
+
+
+def _finalize_fusion_stats(stats):
+    stat_map, count = stats
+    if count == 0:
+        return {tgt: {src: float('nan') for src in MODALITY_ORDER} for tgt in MODALITY_ORDER}
+    out = {}
+    for tgt in MODALITY_ORDER:
+        out[tgt] = {}
+        for src in MODALITY_ORDER:
+            out[tgt][src] = stat_map[tgt][src] / count
+    return out
+
+
+def _format_fusion_stats(fusion_stats):
+    lines = []
+    for tgt in MODALITY_ORDER:
+        items = [f"{src}={_fmt_float(fusion_stats[tgt][src])}" for src in MODALITY_ORDER]
+        lines.append(f"{tgt}<=({', '.join(items)})")
+    return ' | '.join(lines)
+
+
+def _unpack_model_output(model_output):
+    if isinstance(model_output, tuple):
+        if len(model_output) == 3:
+            return model_output
+        if len(model_output) == 2:
+            pred, other_loss = model_output
+            return pred, other_loss, {}
+    return model_output, [], {}
+
 class OceanScaler:
     def __init__(self, mean_path, std_path, device):
         self.mean = torch.tensor(np.load(mean_path).flatten(), dtype=torch.float32).to(device)
@@ -52,6 +127,7 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
     model.train() if need_step else model.eval()
     loss_item, count = 0, 0
     chosen_vars = args.predict_vars.split(',') 
+    fusion_stats = _init_fusion_stats()
 
     for input, target, timestamp, cond_mask, ob_mask in loader:
         input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
@@ -59,7 +135,8 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
         B, T, N, F = input.shape
 
         input_data = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-        predict_dict, other_loss = model(input_data, timestamp, prompt_prefix, cond_mask)
+        predict_dict, other_loss, aux_info = _unpack_model_output(model(input_data, timestamp, prompt_prefix, cond_mask))
+        fusion_stats = _accumulate_fusion_stats(fusion_stats, aux_info.get('fusion_weights', {}))
 
         total_loss = 0
         valid_channels = 0
@@ -95,12 +172,13 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
             L.backward()
             optim.step()
 
-    return loss_item / count if count else 0
+    return (loss_item / count if count else 0), _finalize_fusion_stats(fusion_stats)
 
 def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=None):
     model.eval()
     chosen_vars = args.predict_vars.split(',')
     storage = {v: {"preds": [], "targs": [], "masks": []} for v in chosen_vars}
+    fusion_stats = _init_fusion_stats()
 
     with torch.no_grad():
         for input, target, timestamp, cond_mask, ob_mask in loader:
@@ -109,7 +187,8 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
             B, T, N, F = input.shape
 
             input_proc = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-            predict_dict, _ = model(input_proc, timestamp, prompt_prefix, cond_mask)
+            predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
+            fusion_stats = _accumulate_fusion_stats(fusion_stats, aux_info.get('fusion_weights', {}))
 
             for var in chosen_vars:
                 idx = scaler.var_indices[var]
@@ -130,13 +209,13 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
             all_targs = torch.cat(storage[var]["targs"], 0)
             all_masks = torch.cat(storage[var]["masks"], 0)
             
-            mae, rmse, mape, _, _ = cal_metrics(all_preds, all_targs, all_masks)
-            results[var] = (mae, rmse, mape)
+            mae, rmse, mape, acc, _, _ = cal_metrics(all_preds, all_targs, all_masks)
+            results[var] = (mae, rmse, mape, acc)
             
             if save and LOG_DIR:
                 save_path = os.path.join(LOG_DIR, f'test_{var}.npz')
                 np.savez(save_path, targets=all_targs.cpu().numpy(), predicts=all_preds.cpu().numpy(), mask=all_masks.cpu().numpy())
-    return results
+    return results, _finalize_fusion_stats(fusion_stats)
 
 def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader, test_loader, LOG_DIR):
     optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
@@ -148,13 +227,15 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     patience_count = 0
 
     for epoch in range(args.epoch):
-        train_loss = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True)
+        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True)
         mylogger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
+        mylogger.info(f"[Fusion][Train] Epoch {epoch} {_format_fusion_stats(train_fusion)}")
 
         if epoch % args.val_epoch == 0:
             with torch.no_grad():
-                val_loss = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False)
+                val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False)
             mylogger.info(f"[Validation] Epoch {epoch} Val Loss: {val_loss:.4f}")
+            mylogger.info(f"[Fusion][Val] Epoch {epoch} {_format_fusion_stats(val_fusion)}")
             scheduler.step(val_loss)
             
             if val_loss < best_loss:
@@ -165,9 +246,17 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
                 patience_count += 1
 
         if epoch % args.test_epoch == 0:
-            res = TestEpoch(args, test_loader, model, prompt_prefix, scaler)
+            res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler)
+            mylogger.info(f"[Fusion][Test] Epoch {epoch} {_format_fusion_stats(test_fusion)}")
             for var, metrics in res.items():
-                mylogger.info(f"   -> [Test][{var}] Epoch {epoch} MAE:{metrics[0]} RMSE:{metrics[1]} MAPE:{metrics[2]}")
+                mae, rmse, mape, acc = metrics
+                mylogger.info(
+                    f"   -> [Test][{var}] Epoch {epoch} "
+                    f"{_format_named_metric(mae, var, 'MAE')} | "
+                    f"{_format_named_metric(rmse, var, 'RMSE')} | "
+                    f"{_format_named_metric(mape, var, 'MAPE')} | "
+                    f"{_format_named_metric(acc, var, 'ACC')}"
+                )
 
         if patience_count >= args.patience:
             mylogger.info('early stop')
@@ -175,9 +264,17 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
         
     if best_model:
         model.load_state_dict(best_model, strict=False)
-        final_results = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR)
+        final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR)
+        mylogger.info(f"[Fusion][Final] {_format_fusion_stats(final_fusion)}")
         for var, metrics in final_results.items():
-            mylogger.info(f"[Final Best][{var}] MAE:{metrics[0]} RMSE:{metrics[1]} MAPE:{metrics[2]}")
+            mae, rmse, mape, acc = metrics
+            mylogger.info(
+                f"[Final Best][{var}] "
+                f"{_format_named_metric(mae, var, 'MAE')} | "
+                f"{_format_named_metric(rmse, var, 'RMSE')} | "
+                f"{_format_named_metric(mape, var, 'MAPE')} | "
+                f"{_format_named_metric(acc, var, 'ACC')}"
+            )
 
 if __name__ == '__main__':
     args = InitArgs()
@@ -215,7 +312,8 @@ if __name__ == '__main__':
                         node_emb_dim=args.node_emb_dim, sag_dim=args.sag_dim, sag_tokens=args.sag_tokens,
                         node_embeddings=node_embeddings, use_node_embedding=args.node_embedding,
                         use_timetoken=args.time_token, use_sandglassAttn=args.sandglassAttn,
-                        dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim).to(device)
+                        dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
+                        fusion_mode=args.fusion_mode).to(device)
 
     total_params, total_trainable_params = model.params_num()
     mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')
