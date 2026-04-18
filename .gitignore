@@ -10,6 +10,7 @@ logs/
 *.npz
 *.npy
 
+文献/
 # ===== Mac OS =====
 .DS_Store
 .AppleDouble
