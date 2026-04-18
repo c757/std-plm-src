@@ -60,4 +60,4 @@ __pycache__/
 # ===== Security (Safety first) =====
 *.pem
 *.key
-certs/
+certs/ндов/
