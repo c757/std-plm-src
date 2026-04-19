@@ -37,6 +37,9 @@ def AddModelArgs(parser):
     parser.add_argument("--sag_tokens", default=128, type=int)
     parser.add_argument("--fusion_mode", default="cosine", choices=["cosine", "qkv"], type=str,
                         help="Tri-modal dynamic fusion mode")
+    parser.add_argument("--revin", action="store_true", help="Use RevIN per input window")
+    parser.add_argument("--revin_affine", action="store_true", help="Enable learnable affine in RevIN")
+    parser.add_argument("--fp16", action="store_true", help="Enable AMP (mixed precision) training")
 
 
 def AddDataArgs(parser):
