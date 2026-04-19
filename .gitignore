@@ -9,7 +9,7 @@ logs/
 *.ckpt
 *.npz
 *.npy
-
+tools/
 Ф√┤Г▄╝/
 # ===== Mac OS =====
 .DS_Store
@@ -60,4 +60,4 @@ __pycache__/
 # ===== Security (Safety first) =====
 *.pem
 *.key
-certs/ндов/
+certs/О©╫О©╫О©╫О©╫/
