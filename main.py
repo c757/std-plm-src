@@ -18,6 +18,13 @@ except ImportError:
     nni = None
 import random
 import string
+import json
+import csv
+import matplotlib.pyplot as plt
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 from utils.ocean_dataloader import get_ocean_dataloaders, load_ocean_laplacian_embeddings
 
 # 自动检测计算设备
@@ -136,6 +143,173 @@ def _unpack_model_output(model_output):
             pred, other_loss = model_output
             return pred, other_loss, {}
     return model_output, [], {}
+
+
+def _init_training_history(chosen_vars):
+    history = {
+        'train_loss': {'x': [], 'y': []},
+        'val_loss': {'x': [], 'y': []},
+        'fusion': {
+            split: {
+                tgt: {src: {'x': [], 'y': []} for src in MODALITY_ORDER}
+                for tgt in MODALITY_ORDER
+            }
+            for split in ['train', 'val', 'test', 'final']
+        },
+        'test_metrics': {
+            var: {
+                metric: []  # list of {'epoch': int, 'values': [..]}
+                for metric in ['mae', 'rmse', 'mape', 'acc']
+            }
+            for var in chosen_vars
+        }
+    }
+    return history
+
+
+def _record_fusion_history(history, split, epoch, fusion_stats):
+    if fusion_stats is None:
+        return
+    for tgt in MODALITY_ORDER:
+        for src in MODALITY_ORDER:
+            v = fusion_stats.get(tgt, {}).get(src, float('nan'))
+            history['fusion'][split][tgt][src]['x'].append(epoch)
+            history['fusion'][split][tgt][src]['y'].append(float(v))
+
+
+def _record_test_metrics_history(history, epoch, results):
+    for var, metrics in results.items():
+        mae, rmse, mape, acc = metrics
+        history['test_metrics'][var]['mae'].append({'epoch': int(epoch), 'values': [float(x) for x in mae]})
+        history['test_metrics'][var]['rmse'].append({'epoch': int(epoch), 'values': [float(x) for x in rmse]})
+        history['test_metrics'][var]['mape'].append({'epoch': int(epoch), 'values': [float(x) for x in mape]})
+        history['test_metrics'][var]['acc'].append({'epoch': int(epoch), 'values': [float(x) for x in acc]})
+
+
+def _plot_loss_history(history, log_dir):
+    save_path = os.path.join(log_dir, 'loss_curve.png')
+    draw_loss_line(history['train_loss'], history['val_loss'], save_path)
+
+
+def _plot_fusion_history(history, log_dir):
+    for split in ['train', 'val', 'test', 'final']:
+        plt.figure(figsize=(12, 4))
+        for i, tgt in enumerate(MODALITY_ORDER, start=1):
+            ax = plt.subplot(1, 3, i)
+            for src in MODALITY_ORDER:
+                x = history['fusion'][split][tgt][src]['x']
+                y = history['fusion'][split][tgt][src]['y']
+                if len(x) > 0:
+                    ax.plot(x, y, label=src)
+            ax.set_title(f'{split}:{tgt}')
+            ax.set_xlabel('epoch')
+            ax.set_ylabel('weight')
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(alpha=0.25)
+            if i == 1 and len(ax.lines) > 0:
+                ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(log_dir, f'fusion_{split}.png'))
+        plt.close()
+
+
+def _plot_test_metric_history(history, log_dir):
+    for var, metric_map in history['test_metrics'].items():
+        component_names = COMPONENT_NAMES.get(var, None)
+        for metric_name, records in metric_map.items():
+            if len(records) == 0:
+                continue
+            # records: [{epoch, values:[C]}]
+            epochs = [r['epoch'] for r in records]
+            values = [r['values'] for r in records]
+            c = len(values[0]) if len(values) > 0 else 0
+
+            plt.figure(figsize=(8, 4))
+            for ci in range(c):
+                ys = [v[ci] for v in values]
+                label = component_names[ci] if component_names is not None and ci < len(component_names) else f'c{ci}'
+                # keep original unit convention: mape shown as ratio in history plot for consistency with logs
+                if metric_name == 'mape':
+                    ys = [yy * 100.0 for yy in ys]
+                plt.plot(epochs, ys, marker='o', label=label)
+
+            y_label = metric_name.upper() + (' (%)' if metric_name == 'mape' else '')
+            plt.xlabel('epoch')
+            plt.ylabel(y_label)
+            plt.title(f'Test {metric_name.upper()} - {var}')
+            plt.grid(alpha=0.25)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(log_dir, f'test_{var}_{metric_name}.png'))
+            plt.close()
+
+
+def _save_history_files(history, log_dir):
+    # JSON snapshot
+    with open(os.path.join(log_dir, 'training_history.json'), 'w', encoding='utf-8') as f:
+        json.dump(history, f, indent=2)
+
+    # Flatten test metrics to CSV
+    csv_path = os.path.join(log_dir, 'test_metrics_history.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['var', 'metric', 'epoch', 'component', 'value'])
+        for var, metric_map in history['test_metrics'].items():
+            component_names = COMPONENT_NAMES.get(var, None)
+            for metric_name, records in metric_map.items():
+                for r in records:
+                    ep = r['epoch']
+                    for i, v in enumerate(r['values']):
+                        comp = component_names[i] if component_names is not None and i < len(component_names) else f'c{i}'
+                        vv = float(v) * (100.0 if metric_name == 'mape' else 1.0)
+                        writer.writerow([var, metric_name, ep, comp, vv])
+
+    # Fusion history CSV
+    csv_path2 = os.path.join(log_dir, 'fusion_history.csv')
+    with open(csv_path2, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['split', 'epoch', 'target', 'source', 'weight'])
+        for split in ['train', 'val', 'test', 'final']:
+            for tgt in MODALITY_ORDER:
+                for src in MODALITY_ORDER:
+                    xs = history['fusion'][split][tgt][src]['x']
+                    ys = history['fusion'][split][tgt][src]['y']
+                    for ep, w in zip(xs, ys):
+                        writer.writerow([split, ep, tgt, src, float(w)])
+
+
+def _save_and_plot_history(history, log_dir):
+    _save_history_files(history, log_dir)
+    _plot_loss_history(history, log_dir)
+    _plot_fusion_history(history, log_dir)
+    _plot_test_metric_history(history, log_dir)
+
+
+def _tb_log_fusion(writer, split, epoch, fusion_stats):
+    if writer is None or fusion_stats is None:
+        return
+    for tgt in MODALITY_ORDER:
+        for src in MODALITY_ORDER:
+            v = fusion_stats.get(tgt, {}).get(src, None)
+            if v is not None:
+                writer.add_scalar(f'fusion/{split}/{tgt}_from_{src}', float(v), int(epoch))
+
+
+def _tb_log_test_metrics(writer, epoch, results):
+    if writer is None:
+        return
+    for var, metrics in results.items():
+        mae, rmse, mape, acc = metrics
+        names = COMPONENT_NAMES.get(var, [f'{var}_{i}' for i in range(len(mae))])
+        for i, n in enumerate(names):
+            if i < len(mae):
+                writer.add_scalar(f'test/{var}/MAE/{n}', float(mae[i]), int(epoch))
+            if i < len(rmse):
+                writer.add_scalar(f'test/{var}/RMSE/{n}', float(rmse[i]), int(epoch))
+            if i < len(mape):
+                writer.add_scalar(f'test/{var}/MAPE_percent/{n}', float(mape[i]) * 100.0, int(epoch))
+            if i < len(acc):
+                writer.add_scalar(f'test/{var}/ACC/{n}', float(acc[i]), int(epoch))
 
 class OceanScaler:
     def __init__(self, mean_path, std_path, device):
@@ -269,19 +443,55 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     best_loss = 1e9
     best_model = None
     patience_count = 0
+<<<<<<< HEAD
+    chosen_vars = args.predict_vars.split(',')
+    history = _init_training_history(chosen_vars)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
     amp_scaler = None
     if getattr(args, 'fp16', False):
         # Use positional 'cuda' for compatibility with current torch version
         amp_scaler = torch.amp.GradScaler('cuda')
+<<<<<<< HEAD
+
+    tb_writer = None
+    if getattr(args, 'tensorboard', False):
+        if SummaryWriter is None:
+            mylogger.warning('TensorBoard is requested but SummaryWriter is unavailable. Please install tensorboard package.')
+        else:
+            tb_dir = os.path.join(LOG_DIR, args.tb_subdir)
+            check_dir(tb_dir, mkdir=True)
+            tb_writer = SummaryWriter(log_dir=tb_dir)
+            mylogger.info(f'[TensorBoard] logging to: {tb_dir}')
 
     for epoch in range(args.epoch):
         train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True, amp_scaler=amp_scaler)
+        history['train_loss']['x'].append(epoch)
+        history['train_loss']['y'].append(float(train_loss))
+        _record_fusion_history(history, 'train', epoch, train_fusion)
+        if tb_writer is not None:
+            tb_writer.add_scalar('loss/train', float(train_loss), epoch)
+            _tb_log_fusion(tb_writer, 'train', epoch, train_fusion)
+=======
+
+    for epoch in range(args.epoch):
+        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True, amp_scaler=amp_scaler)
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
         mylogger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
         mylogger.info(f"[Fusion][Train] Epoch {epoch} {_format_fusion_stats(train_fusion)}")
 
         if epoch % args.val_epoch == 0:
             with torch.no_grad():
                 val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False, amp_scaler=amp_scaler)
+<<<<<<< HEAD
+            history['val_loss']['x'].append(epoch)
+            history['val_loss']['y'].append(float(val_loss))
+            _record_fusion_history(history, 'val', epoch, val_fusion)
+            if tb_writer is not None:
+                tb_writer.add_scalar('loss/val', float(val_loss), epoch)
+                _tb_log_fusion(tb_writer, 'val', epoch, val_fusion)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
             mylogger.info(f"[Validation] Epoch {epoch} Val Loss: {val_loss:.4f}")
             mylogger.info(f"[Fusion][Val] Epoch {epoch} {_format_fusion_stats(val_fusion)}")
             scheduler.step(val_loss)
@@ -295,6 +505,14 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
 
         if epoch % args.test_epoch == 0:
             res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, amp_scaler=amp_scaler)
+<<<<<<< HEAD
+            _record_fusion_history(history, 'test', epoch, test_fusion)
+            _record_test_metrics_history(history, epoch, res)
+            if tb_writer is not None:
+                _tb_log_fusion(tb_writer, 'test', epoch, test_fusion)
+                _tb_log_test_metrics(tb_writer, epoch, res)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
             mylogger.info(f"[Fusion][Test] Epoch {epoch} {_format_fusion_stats(test_fusion)}")
             for var, metrics in res.items():
                 mae, rmse, mape, acc = metrics
@@ -313,6 +531,13 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     if best_model:
         model.load_state_dict(best_model, strict=False)
         final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR, amp_scaler=amp_scaler)
+<<<<<<< HEAD
+        _record_fusion_history(history, 'final', -1, final_fusion)
+        if tb_writer is not None:
+            _tb_log_fusion(tb_writer, 'final', 0, final_fusion)
+            _tb_log_test_metrics(tb_writer, 0, final_results)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
         mylogger.info(f"[Fusion][Final] {_format_fusion_stats(final_fusion)}")
         for var, metrics in final_results.items():
             mae, rmse, mape, acc = metrics
@@ -323,6 +548,13 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
                 f"{_format_named_metric(mape, var, 'MAPE')} | "
                 f"{_format_named_metric(acc, var, 'ACC')}"
             )
+
+    # Persist and visualize history artifacts for post-analysis
+    _save_and_plot_history(history, LOG_DIR)
+
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
 if __name__ == '__main__':
     args = InitArgs()
