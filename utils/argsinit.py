@@ -40,8 +40,11 @@ def AddModelArgs(parser):
     parser.add_argument("--revin", action="store_true", help="Use RevIN per input window")
     parser.add_argument("--revin_affine", action="store_true", help="Enable learnable affine in RevIN")
     parser.add_argument("--fp16", action="store_true", help="Enable AMP (mixed precision) training")
+<<<<<<< HEAD
     parser.add_argument("--tensorboard", action="store_true", help="Enable TensorBoard scalar logging")
     parser.add_argument("--tb_subdir", default="tensorboard", type=str, help="TensorBoard subdirectory under LOG_DIR")
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
 
 
 def AddDataArgs(parser):

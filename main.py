@@ -443,12 +443,16 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     best_loss = 1e9
     best_model = None
     patience_count = 0
+<<<<<<< HEAD
     chosen_vars = args.predict_vars.split(',')
     history = _init_training_history(chosen_vars)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
     amp_scaler = None
     if getattr(args, 'fp16', False):
         # Use positional 'cuda' for compatibility with current torch version
         amp_scaler = torch.amp.GradScaler('cuda')
+<<<<<<< HEAD
 
     tb_writer = None
     if getattr(args, 'tensorboard', False):
@@ -468,18 +472,26 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
         if tb_writer is not None:
             tb_writer.add_scalar('loss/train', float(train_loss), epoch)
             _tb_log_fusion(tb_writer, 'train', epoch, train_fusion)
+=======
+
+    for epoch in range(args.epoch):
+        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True, amp_scaler=amp_scaler)
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
         mylogger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
         mylogger.info(f"[Fusion][Train] Epoch {epoch} {_format_fusion_stats(train_fusion)}")
 
         if epoch % args.val_epoch == 0:
             with torch.no_grad():
                 val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False, amp_scaler=amp_scaler)
+<<<<<<< HEAD
             history['val_loss']['x'].append(epoch)
             history['val_loss']['y'].append(float(val_loss))
             _record_fusion_history(history, 'val', epoch, val_fusion)
             if tb_writer is not None:
                 tb_writer.add_scalar('loss/val', float(val_loss), epoch)
                 _tb_log_fusion(tb_writer, 'val', epoch, val_fusion)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
             mylogger.info(f"[Validation] Epoch {epoch} Val Loss: {val_loss:.4f}")
             mylogger.info(f"[Fusion][Val] Epoch {epoch} {_format_fusion_stats(val_fusion)}")
             scheduler.step(val_loss)
@@ -493,11 +505,14 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
 
         if epoch % args.test_epoch == 0:
             res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, amp_scaler=amp_scaler)
+<<<<<<< HEAD
             _record_fusion_history(history, 'test', epoch, test_fusion)
             _record_test_metrics_history(history, epoch, res)
             if tb_writer is not None:
                 _tb_log_fusion(tb_writer, 'test', epoch, test_fusion)
                 _tb_log_test_metrics(tb_writer, epoch, res)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
             mylogger.info(f"[Fusion][Test] Epoch {epoch} {_format_fusion_stats(test_fusion)}")
             for var, metrics in res.items():
                 mae, rmse, mape, acc = metrics
@@ -516,10 +531,13 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     if best_model:
         model.load_state_dict(best_model, strict=False)
         final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR, amp_scaler=amp_scaler)
+<<<<<<< HEAD
         _record_fusion_history(history, 'final', -1, final_fusion)
         if tb_writer is not None:
             _tb_log_fusion(tb_writer, 'final', 0, final_fusion)
             _tb_log_test_metrics(tb_writer, 0, final_results)
+=======
+>>>>>>> c8025504773d22d6913747305016a1ae5204d64c
         mylogger.info(f"[Fusion][Final] {_format_fusion_stats(final_fusion)}")
         for var, metrics in final_results.items():
             mae, rmse, mape, acc = metrics
