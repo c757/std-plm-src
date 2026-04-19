@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from typing import Any, Dict, Optional, Tuple, Union
 from utils.utils import norm_Adj, lap_eig, topological_sort
 from model.sandglassAttn import SAG, CrossModalityAlignment
+from model.RevIN import RevIN
 import numpy as np
 from model.position import PositionalEncoding
 class TimeEmbedding(nn.Module):
@@ -217,7 +218,8 @@ class STALLM_MIMO(nn.Module):
                  input_dim, output_dim, node_emb_dim, sag_dim, sag_tokens,
                  node_embeddings=None, use_node_embedding=True,
                  use_timetoken=True, use_sandglassAttn=True,
-                 dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine"): 
+                 dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine",
+                 use_revin=False, revin_affine=True): 
         super().__init__()
         
         self.sample_len = sample_len
@@ -227,6 +229,7 @@ class STALLM_MIMO(nn.Module):
         self.use_sandglassAttn = use_sandglassAttn
         self.use_node_embedding = use_node_embedding
         self.fusion_mode = fusion_mode
+        self.use_revin = use_revin
         
         tim_dim = t_dim * 2
         
@@ -254,6 +257,12 @@ class STALLM_MIMO(nn.Module):
         self.head_wave = DecodingLayer(self.emb_dim, self.dims['wave'] * output_len)
         self.head_wind = DecodingLayer(self.emb_dim, self.dims['wind'] * output_len)
 
+        # 可逆实例归一化（按变量分组）
+        if self.use_revin:
+            self.revin_flow = RevIN(num_features=self.dims['flow'], affine=revin_affine)
+            self.revin_wave = RevIN(num_features=self.dims['wave'], affine=revin_affine)
+            self.revin_wind = RevIN(num_features=self.dims['wind'], affine=revin_affine)
+
         # 基礎組件
         self.timeembedding = TimeEmbedding(t_dim=t_dim)
         if use_node_embedding:
@@ -265,16 +274,26 @@ class STALLM_MIMO(nn.Module):
         mask_reshaped = mask.view(B, N, self.sample_len, -1)
         
         # 💡 物理索引精確切片 (对齐 8 维新数据)
-        x_f = x_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
+        x_f_4d = x_reshaped[..., [0, 1]].contiguous()
         m_f = mask_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
         
         # 波浪增加第 5 维 (包含 sin 和 cos)
-        x_wa = x_reshaped[..., [2, 3, 4, 5]].contiguous().view(B, N, -1)
+        x_wa_4d = x_reshaped[..., [2, 3, 4, 5]].contiguous()
         m_wa = mask_reshaped[..., [2, 3, 4, 5]].contiguous().view(B, N, -1)
         
         # 海风被挤到了第 6, 7 维
-        x_wi = x_reshaped[..., [6, 7]].contiguous().view(B, N, -1)
+        x_wi_4d = x_reshaped[..., [6, 7]].contiguous()
         m_wi = mask_reshaped[..., [6, 7]].contiguous().view(B, N, -1)
+
+        # RevIN: 使用当前输入窗口统计量做归一化（per-batch, per-channel）
+        if self.use_revin:
+            x_f_4d = self.revin_flow(x_f_4d, 'norm')
+            x_wa_4d = self.revin_wave(x_wa_4d, 'norm')
+            x_wi_4d = self.revin_wind(x_wi_4d, 'norm')
+
+        x_f = x_f_4d.view(B, N, -1)
+        x_wa = x_wa_4d.view(B, N, -1)
+        x_wi = x_wi_4d.view(B, N, -1)
 
         te = self.timeembedding(timestamp[:, :self.sample_len, :])
         ne = self.node_embd_layer() if self.use_node_embedding else None
@@ -314,10 +333,20 @@ class STALLM_MIMO(nn.Module):
             decoded_wa = hidden_wa + tokens_wa
             decoded_wi = hidden_wi + tokens_wi
         
+        pred_flow = self.head_flow(decoded_f).view(B, N, self.output_len, self.dims['flow'])
+        pred_wave = self.head_wave(decoded_wa).view(B, N, self.output_len, self.dims['wave'])
+        pred_wind = self.head_wind(decoded_wi).view(B, N, self.output_len, self.dims['wind'])
+
+        # RevIN 反归一化：将预测恢复到输入窗口对应的原始尺度
+        if self.use_revin:
+            pred_flow = self.revin_flow(pred_flow, 'denorm')
+            pred_wave = self.revin_wave(pred_wave, 'denorm')
+            pred_wind = self.revin_wind(pred_wind, 'denorm')
+
         return {
-            "flow": self.head_flow(decoded_f),
-            "wave": self.head_wave(decoded_wa),
-            "wind": self.head_wind(decoded_wi)
+            "flow": pred_flow.contiguous().view(B, N, -1),
+            "wave": pred_wave.contiguous().view(B, N, -1),
+            "wind": pred_wind.contiguous().view(B, N, -1)
         }, [], {"fusion_weights": weight_dict}
 
     def params_num(self):
@@ -325,7 +354,7 @@ class STALLM_MIMO(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total, trainable
     
-    
+
     def grad_state_dict(self):
         return {n: p.detach() for n, p in self.named_parameters() if p.requires_grad}
 

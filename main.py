@@ -40,6 +40,13 @@ COMPONENT_NAMES = {
 
 MODALITY_ORDER = ['flow', 'wave', 'wind']
 
+# Per-component physical units (used for MAE/RMSE). Empty string means unitless.
+COMPONENT_UNITS = {
+    'flow': ['m/s', 'm/s'],
+    'wave': ['m', '', '', 's'],
+    'wind': ['m/s', 'm/s'],
+}
+
 
 def _fmt_float(v, ndigits=4):
     try:
@@ -51,10 +58,33 @@ def _fmt_float(v, ndigits=4):
 
 
 def _format_named_metric(values, var_name, metric_name):
+    # Resolve names and units for each channel
     names = COMPONENT_NAMES.get(var_name, [f"{var_name}_{i}" for i in range(len(values))])
+    units = COMPONENT_UNITS.get(var_name, ["" for _ in range(len(values))])
     if len(names) < len(values):
         names += [f"{var_name}_{i}" for i in range(len(names), len(values))]
-    pairs = [f"{names[i]}={_fmt_float(values[i])}" for i in range(len(values))]
+    if len(units) < len(values):
+        units += ["" for _ in range(len(units), len(values))]
+
+    pairs = []
+    for i in range(len(values)):
+        val = values[i]
+        unit = units[i]
+
+        # For MAPE show percent
+        if metric_name.upper().startswith('MAPE'):
+            disp = _fmt_float(float(val) * 100.0)
+            suffix = '%'
+        elif metric_name.upper().startswith('ACC'):
+            # ACC is dimensionless (correlation-like)
+            disp = _fmt_float(val)
+            suffix = ''
+        else:
+            disp = _fmt_float(val)
+            suffix = f" {unit}" if unit else ''
+
+        pairs.append(f"{names[i]}={disp}{suffix}")
+
     return f"{metric_name}[{', '.join(pairs)}]"
 
 
@@ -123,7 +153,7 @@ class OceanScaler:
         s = self.std[idx].view(1, 1, 1, -1)
         return data * s + m
 
-def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool):
+def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool, amp_scaler=None):
     model.train() if need_step else model.eval()
     loss_item, count = 0, 0
     chosen_vars = args.predict_vars.split(',') 
@@ -135,7 +165,12 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
         B, T, N, F = input.shape
 
         input_data = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-        predict_dict, other_loss, aux_info = _unpack_model_output(model(input_data, timestamp, prompt_prefix, cond_mask))
+        # Use AMP autocast in forward if requested
+        if getattr(args, 'fp16', False):
+            with torch.amp.autocast(device_type='cuda'):
+                predict_dict, other_loss, aux_info = _unpack_model_output(model(input_data, timestamp, prompt_prefix, cond_mask))
+        else:
+            predict_dict, other_loss, aux_info = _unpack_model_output(model(input_data, timestamp, prompt_prefix, cond_mask))
         fusion_stats = _accumulate_fusion_stats(fusion_stats, aux_info.get('fusion_weights', {}))
 
         total_loss = 0
@@ -169,12 +204,17 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
             optim.zero_grad()
             L = total_loss
             for l in other_loss: L += l
-            L.backward()
-            optim.step()
+            if getattr(args, 'fp16', False):
+                amp_scaler.scale(L).backward()
+                amp_scaler.step(optim)
+                amp_scaler.update()
+            else:
+                L.backward()
+                optim.step()
 
     return (loss_item / count if count else 0), _finalize_fusion_stats(fusion_stats)
 
-def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=None):
+def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=None, amp_scaler=None):
     model.eval()
     chosen_vars = args.predict_vars.split(',')
     storage = {v: {"preds": [], "targs": [], "masks": []} for v in chosen_vars}
@@ -187,7 +227,11 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
             B, T, N, F = input.shape
 
             input_proc = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-            predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
+            if getattr(args, 'fp16', False):
+                with torch.amp.autocast(device_type='cuda'):
+                    predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
+            else:
+                predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
             fusion_stats = _accumulate_fusion_stats(fusion_stats, aux_info.get('fusion_weights', {}))
 
             for var in chosen_vars:
@@ -225,15 +269,19 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     best_loss = 1e9
     best_model = None
     patience_count = 0
+    amp_scaler = None
+    if getattr(args, 'fp16', False):
+        # Use positional 'cuda' for compatibility with current torch version
+        amp_scaler = torch.amp.GradScaler('cuda')
 
     for epoch in range(args.epoch):
-        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True)
+        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True, amp_scaler=amp_scaler)
         mylogger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
         mylogger.info(f"[Fusion][Train] Epoch {epoch} {_format_fusion_stats(train_fusion)}")
 
         if epoch % args.val_epoch == 0:
             with torch.no_grad():
-                val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False)
+                val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False, amp_scaler=amp_scaler)
             mylogger.info(f"[Validation] Epoch {epoch} Val Loss: {val_loss:.4f}")
             mylogger.info(f"[Fusion][Val] Epoch {epoch} {_format_fusion_stats(val_fusion)}")
             scheduler.step(val_loss)
@@ -246,7 +294,7 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
                 patience_count += 1
 
         if epoch % args.test_epoch == 0:
-            res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler)
+            res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, amp_scaler=amp_scaler)
             mylogger.info(f"[Fusion][Test] Epoch {epoch} {_format_fusion_stats(test_fusion)}")
             for var, metrics in res.items():
                 mae, rmse, mape, acc = metrics
@@ -264,7 +312,7 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
         
     if best_model:
         model.load_state_dict(best_model, strict=False)
-        final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR)
+        final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR, amp_scaler=amp_scaler)
         mylogger.info(f"[Fusion][Final] {_format_fusion_stats(final_fusion)}")
         for var, metrics in final_results.items():
             mae, rmse, mape, acc = metrics
@@ -278,11 +326,27 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
 
 if __name__ == '__main__':
     args = InitArgs()
-    
-    if args.model == 'transformer':
-        basemodel = Transformer(args.causal, args.lora, args.ln_grad, args.llm_layers)
+
+    # Map --model string to the correct BaseModel class.
+    model_name = args.model.lower() if isinstance(args.model, str) else ''
+    if model_name == 'transformer':
+        ModelClass = Transformer
+    elif model_name == 'phi2':
+        ModelClass = Phi2
+    elif model_name == 'gpt2':
+        ModelClass = GPT2
+    elif model_name.startswith('qwen'):
+        # allow 'qwen', 'qwen3' etc.
+        ModelClass = QWEN
+    elif model_name.startswith('llama') or model_name.startswith('llama3'):
+        ModelClass = LLAMA3
     else:
-        basemodel = QWEN(args.causal, args.lora, args.ln_grad, args.llm_layers)
+        # If an unknown model string is provided, raise an informative error rather than silently
+        # falling back to QWEN (which caused confusion).
+        raise ValueError(f"Unknown --model '{args.model}'. Supported: phi2, gpt2, transformer, qwen, llama3")
+
+    print(f"Selected base model: {model_name}")
+    basemodel = ModelClass(args.causal, args.lora, args.ln_grad, args.llm_layers)
     
     ocean_data_dir = './data/stdplm_input_025'
     # 💡 核心修复：强制设置 num_workers=0，禁止 Windows 多进程复制撑爆内存
@@ -313,7 +377,8 @@ if __name__ == '__main__':
                         node_embeddings=node_embeddings, use_node_embedding=args.node_embedding,
                         use_timetoken=args.time_token, use_sandglassAttn=args.sandglassAttn,
                         dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
-                        fusion_mode=args.fusion_mode).to(device)
+                        fusion_mode=args.fusion_mode,
+                        use_revin=args.revin, revin_affine=args.revin_affine).to(device)
 
     total_params, total_trainable_params = model.params_num()
     mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')

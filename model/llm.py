@@ -7,8 +7,8 @@ from modelscope.models import Model
 from torch.nn.parameter import Parameter
 from typing import Any, Dict, Optional, Tuple, Union
 from swift.tuners import Swift, LoraConfig
-from modelscope import AutoTokenizer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from modelscope import AutoTokenizer as MS_AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer as HF_AutoTokenizer
 
 class BaseModel(nn.Module):
     def __init__(self):
@@ -81,7 +81,19 @@ class Phi2(BaseModel):
                 if 'ln' in name: # or 'mlp' in name:
                     param.requires_grad = True
 
-        self.tokenizer = AutoTokenizer.from_pretrained("AI-ModelScope/phi-2", trust_remote_code=True)
+        # ModelScope tokenizer for ModelScope-hosted model id
+        try:
+            self.tokenizer = MS_AutoTokenizer.from_pretrained("AI-ModelScope/phi-2", trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load ModelScope tokenizer for 'AI-ModelScope/phi-2'.\n"
+                "This can happen when the model id isn't available on HuggingFace or ModelScope from this machine,\n"
+                "or network/authentication is required.\n"
+                "Possible fixes:\n"
+                " - Ensure you have network access and the model id is correct.\n"
+                " - If the model is private, authenticate with the provider (e.g., `hf auth login` for HuggingFace or follow ModelScope auth).\n"
+                " - Alternatively place the tokenizer files locally and point to the local path.\n"
+                f"Original error: {e}") from e
 
     def forward(self,x:torch.FloatTensor):
 
@@ -147,7 +159,14 @@ class GPT2(BaseModel):
                 if 'ln' in name  or 'wpe' in name:
                     param.requires_grad = True
 
-        self.tokenizer = AutoTokenizer.from_pretrained("AI-ModelScope/gpt2", trust_remote_code=True)
+        # ModelScope tokenizer for ModelScope-hosted model id
+        try:
+            self.tokenizer = MS_AutoTokenizer.from_pretrained("AI-ModelScope/gpt2", trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load ModelScope tokenizer for 'AI-ModelScope/gpt2'.\n"
+                "See suggestions in the error message for phi2 above.\n"
+                f"Original error: {e}") from e
 
     def forward(self,x:torch.FloatTensor,attention_mask=None):
 
@@ -222,7 +241,14 @@ class LLAMA3(BaseModel):
                 if 'norm' in name  or 'wpe' in name:
                     param.requires_grad = True
 
-        self.tokenizer = AutoTokenizer.from_pretrained("LLM-Research/Meta-Llama-3-8B-Instruct", trust_remote_code=True)
+        # ModelScope tokenizer for Llama3 model (ModelScope)
+        try:
+            self.tokenizer = MS_AutoTokenizer.from_pretrained("LLM-Research/Meta-Llama-3-8B-Instruct", trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load ModelScope tokenizer for 'LLM-Research/Meta-Llama-3-8B-Instruct'.\n"
+                "See suggestions in the error message for phi2 above.\n"
+                f"Original error: {e}") from e
 
     def forward(self,x:torch.FloatTensor,attention_mask=None):
 
@@ -278,7 +304,15 @@ class QWEN(BaseModel):
                 if 'norm' in name:
                     param.requires_grad = True
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        # QWEN is hosted on HuggingFace; use HF AutoTokenizer
+        try:
+            self.tokenizer = HF_AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load HuggingFace tokenizer for '{model_id}'.\n"
+                "If this is a private HF repo, run `huggingface-cli login` or set environment token.\n"
+                "If offline, provide a local path to tokenizer files.\n"
+                f"Original error: {e}") from e
 
     def forward(self, x:torch.FloatTensor, attention_mask=None):
         # 1. 强制将输入数据转换为与大模型权重一致的半精度 (FP16)
