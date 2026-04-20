@@ -80,20 +80,37 @@ class OceanDataset(Dataset):
         
         return x, y, timestamp, cond_mask, ob_mask
 
-def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4):
+def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='node'):
     data_nodes_path = f'{data_dir}/data_nodes.npy'
     data_grid_path = f'{data_dir}/data_grid.npy'
-    if os.path.exists(data_grid_path):
-        data_path = data_grid_path
-    elif os.path.exists(data_nodes_path):
-        data_path = data_nodes_path
+    layout = (input_layout or 'node').lower()
+
+    if layout == 'node':
+        if os.path.exists(data_nodes_path):
+            data_path = data_nodes_path
+        elif os.path.exists(data_grid_path):
+            # Commit-0 default prefers node, but fallback keeps training runnable.
+            print('[DataLoader] input_layout=node but data_nodes.npy is missing; fallback to data_grid.npy')
+            data_path = data_grid_path
+        else:
+            raise FileNotFoundError(f'Cannot find data file: {data_nodes_path} or {data_grid_path}')
+    elif layout == 'grid':
+        if os.path.exists(data_grid_path):
+            data_path = data_grid_path
+        elif os.path.exists(data_nodes_path):
+            print('[DataLoader] input_layout=grid but data_grid.npy is missing; fallback to data_nodes.npy')
+            data_path = data_nodes_path
+        else:
+            raise FileNotFoundError(f'Cannot find data file: {data_grid_path} or {data_nodes_path}')
     else:
-        raise FileNotFoundError(f'Cannot find data file: {data_grid_path} or {data_nodes_path}')
+        raise ValueError(f'Unsupported input_layout={input_layout}, expected one of: node, grid')
 
     indices_path = f'{data_dir}/indices.npz'
     import json
     with open(f'{data_dir}/meta.json', 'r') as f:
         meta = json.load(f)
+
+    print(f'[DataLoader] input_layout={layout}, using file: {os.path.basename(data_path)}')
     
     datasets = {}
     dataloaders = {}

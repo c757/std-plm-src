@@ -68,6 +68,14 @@ def AddDataArgs(parser):
 
     parser.add_argument("--output_dim", default=1, type=int)
 
+    parser.add_argument(
+        "--input_layout",
+        default="node",
+        choices=["node", "grid"],
+        type=str,
+        help="Input layout mode for dataloader selection. Commit-0 default keeps node-path behavior.",
+    )
+
 def AddTrainArgs(parser):
 
     parser.add_argument("--lr", default=0.001, type=float)

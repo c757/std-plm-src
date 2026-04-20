@@ -569,7 +569,12 @@ if __name__ == '__main__':
     
     ocean_data_dir = './data/stdplm_input_025'
     # 💡 核心修复：强制设置 num_workers=0，禁止 Windows 多进程复制撑爆内存
-    dataloaders = get_ocean_dataloaders(ocean_data_dir, batch_size=args.batch_size, num_workers=0)
+    dataloaders = get_ocean_dataloaders(
+        ocean_data_dir,
+        batch_size=args.batch_size,
+        num_workers=0,
+        input_layout=args.input_layout,
+    )
     train_loader, val_loader, test_loader = dataloaders['train'], dataloaders['val'], dataloaders['test']
     
     scaler = OceanScaler(f'{ocean_data_dir}/norm_mean.npy', f'{ocean_data_dir}/norm_std.npy', device)
@@ -582,6 +587,7 @@ if __name__ == '__main__':
     mylogger.info(f"Base model: {model_name}")
     mylogger.info(f"Fusion mode: {fusion_mode_name} ({fusion_desc})")
     mylogger.info(f"Cross-modal QKV attention enabled: {using_qkv_attention}")
+    mylogger.info(f"Input layout: {args.input_layout}")
 
     output_len = args.predict_len
     if args.task == 'all': output_len += args.sample_len

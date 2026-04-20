@@ -6,7 +6,7 @@ set -euo pipefail
 #   PYTHON=/path/to/python LOG_ROOT=./logs ./scripts/run_main_nohup.sh KEY=VALUE ...
 # Keys accepted as KEY=VALUE pairs: TASK,MODEL,LLM_LAYERS,BATCH_SIZE,SAMPLE_LEN,PREDICT_LEN,
 # SAG_TOKENS,TRUNC_K,EPOCH,VAL_EPOCH,SANDGLASSATTN(1/0),NODE_EMBEDDING(1/0),TIME_TOKEN(1/0),
-# DROPOUT,LR,WEIGHT_DECAY,PATIENCE,LOG_ROOT,PREDICT_VARS,LOG_DIR
+# DROPOUT,LR,WEIGHT_DECAY,PATIENCE,LOG_ROOT,PREDICT_VARS,INPUT_LAYOUT,LOG_DIR
 
 # Defaults (can be overridden by environment variables or KEY=VALUE args)
 : ${PYTHON:=python}
@@ -29,6 +29,7 @@ set -euo pipefail
 : ${PATIENCE:=5}
 : ${LOG_ROOT:=./logs}
 : ${PREDICT_VARS:="flow,wind,wave"}
+: ${INPUT_LAYOUT:=node}
 
 # Allow overrides passed as KEY=VALUE arguments
 for ARG in "$@"; do
@@ -70,6 +71,7 @@ CMD+=(--weight_decay "$WEIGHT_DECAY")
 CMD+=(--patience "$PATIENCE")
 CMD+=(--log_root "$LOG_DIR")
 CMD+=(--predict_vars "$PREDICT_VARS")
+CMD+=(--input_layout "$INPUT_LAYOUT")
 
 # Start with nohup, redirect stdout/stderr to file, save pid
 NOHUP_OUT="$LOG_DIR/nohup.out"
