@@ -9,7 +9,7 @@ logs/
 *.ckpt
 *.npz
 *.npy
-tools/
+
 文献/
 # ===== Mac OS =====
 .DS_Store

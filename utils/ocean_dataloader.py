@@ -32,13 +32,23 @@ class OceanDataset(Dataset):
         data_dir = os.path.dirname(data_path)
         # 【修复2】：必须用 'r' (只读)，保护你的 24GB 内存不被多进程吃光！
         self.data = np.load(data_path, mmap_mode='r')
+        self.is_grid_layout = (self.data.ndim == 4)  # (T, H, W, C)
         self.indices = np.load(indices_path)[f'{split}_idx']
         self.sample_len = sample_len
         self.predict_len = predict_len
         self.window = sample_len + predict_len
         
         # 【修复3】：让搬运工认识真实的海洋地图和真实的时间
-        self.ocean_mask = torch.tensor(np.load(f'{data_dir}/ocean_mask.npy'), dtype=torch.float32)
+        mask_2d_path = f'{data_dir}/ocean_mask_2d.npy'
+        mask_1d_path = f'{data_dir}/ocean_mask.npy'
+        if os.path.exists(mask_2d_path):
+            mask_np = np.load(mask_2d_path).astype(np.float32).reshape(-1)
+        elif os.path.exists(mask_1d_path):
+            mask_np = np.load(mask_1d_path).astype(np.float32).reshape(-1)
+        else:
+            raise FileNotFoundError(f'Cannot find ocean mask file: {mask_2d_path} or {mask_1d_path}')
+
+        self.ocean_mask = torch.tensor(mask_np, dtype=torch.float32)
         self.timestamps = pd.to_datetime(np.load(f'{data_dir}/timestamps.npy'))
 
     def __len__(self):
@@ -49,6 +59,11 @@ class OceanDataset(Dataset):
         end_t = start_t + self.window
         
         window_data = self.data[start_t:end_t]
+        if self.is_grid_layout:
+            # Convert (T, H, W, C) -> (T, N, C) to keep current training/model contract unchanged.
+            tw, h, w, c = window_data.shape
+            window_data = window_data.reshape(tw, h * w, c)
+
         x = torch.tensor(window_data[:self.sample_len].copy(), dtype=torch.float32)
         y = torch.tensor(window_data[self.sample_len:].copy(), dtype=torch.float32)
         
@@ -66,7 +81,15 @@ class OceanDataset(Dataset):
         return x, y, timestamp, cond_mask, ob_mask
 
 def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4):
-    data_path = f'{data_dir}/data_nodes.npy'
+    data_nodes_path = f'{data_dir}/data_nodes.npy'
+    data_grid_path = f'{data_dir}/data_grid.npy'
+    if os.path.exists(data_grid_path):
+        data_path = data_grid_path
+    elif os.path.exists(data_nodes_path):
+        data_path = data_nodes_path
+    else:
+        raise FileNotFoundError(f'Cannot find data file: {data_grid_path} or {data_nodes_path}')
+
     indices_path = f'{data_dir}/indices.npz'
     import json
     with open(f'{data_dir}/meta.json', 'r') as f:
