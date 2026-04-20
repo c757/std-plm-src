@@ -443,16 +443,12 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     best_loss = 1e9
     best_model = None
     patience_count = 0
-<<<<<<< HEAD
     chosen_vars = args.predict_vars.split(',')
     history = _init_training_history(chosen_vars)
-=======
->>>>>>> c8025504773d22d6913747305016a1ae5204d64c
     amp_scaler = None
     if getattr(args, 'fp16', False):
         # Use positional 'cuda' for compatibility with current torch version
         amp_scaler = torch.amp.GradScaler('cuda')
-<<<<<<< HEAD
 
     tb_writer = None
     if getattr(args, 'tensorboard', False):
@@ -472,26 +468,18 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
         if tb_writer is not None:
             tb_writer.add_scalar('loss/train', float(train_loss), epoch)
             _tb_log_fusion(tb_writer, 'train', epoch, train_fusion)
-=======
-
-    for epoch in range(args.epoch):
-        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True, amp_scaler=amp_scaler)
->>>>>>> c8025504773d22d6913747305016a1ae5204d64c
         mylogger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
         mylogger.info(f"[Fusion][Train] Epoch {epoch} {_format_fusion_stats(train_fusion)}")
 
         if epoch % args.val_epoch == 0:
             with torch.no_grad():
                 val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False, amp_scaler=amp_scaler)
-<<<<<<< HEAD
             history['val_loss']['x'].append(epoch)
             history['val_loss']['y'].append(float(val_loss))
             _record_fusion_history(history, 'val', epoch, val_fusion)
             if tb_writer is not None:
                 tb_writer.add_scalar('loss/val', float(val_loss), epoch)
                 _tb_log_fusion(tb_writer, 'val', epoch, val_fusion)
-=======
->>>>>>> c8025504773d22d6913747305016a1ae5204d64c
             mylogger.info(f"[Validation] Epoch {epoch} Val Loss: {val_loss:.4f}")
             mylogger.info(f"[Fusion][Val] Epoch {epoch} {_format_fusion_stats(val_fusion)}")
             scheduler.step(val_loss)
@@ -505,14 +493,11 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
 
         if epoch % args.test_epoch == 0:
             res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, amp_scaler=amp_scaler)
-<<<<<<< HEAD
             _record_fusion_history(history, 'test', epoch, test_fusion)
             _record_test_metrics_history(history, epoch, res)
             if tb_writer is not None:
                 _tb_log_fusion(tb_writer, 'test', epoch, test_fusion)
                 _tb_log_test_metrics(tb_writer, epoch, res)
-=======
->>>>>>> c8025504773d22d6913747305016a1ae5204d64c
             mylogger.info(f"[Fusion][Test] Epoch {epoch} {_format_fusion_stats(test_fusion)}")
             for var, metrics in res.items():
                 mae, rmse, mape, acc = metrics
@@ -531,13 +516,10 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     if best_model:
         model.load_state_dict(best_model, strict=False)
         final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR, amp_scaler=amp_scaler)
-<<<<<<< HEAD
         _record_fusion_history(history, 'final', -1, final_fusion)
         if tb_writer is not None:
             _tb_log_fusion(tb_writer, 'final', 0, final_fusion)
             _tb_log_test_metrics(tb_writer, 0, final_results)
-=======
->>>>>>> c8025504773d22d6913747305016a1ae5204d64c
         mylogger.info(f"[Fusion][Final] {_format_fusion_stats(final_fusion)}")
         for var, metrics in final_results.items():
             mae, rmse, mape, acc = metrics
@@ -577,7 +559,12 @@ if __name__ == '__main__':
         # falling back to QWEN (which caused confusion).
         raise ValueError(f"Unknown --model '{args.model}'. Supported: phi2, gpt2, transformer, qwen, llama3")
 
+    fusion_mode_name = args.fusion_mode.lower() if isinstance(args.fusion_mode, str) else 'cosine'
+    using_qkv_attention = (fusion_mode_name == 'qkv')
+    fusion_desc = "QKV cross-modal attention" if using_qkv_attention else "cosine-based dynamic cross-modal fusion"
+
     print(f"Selected base model: {model_name}")
+    print(f"Fusion mode: {fusion_mode_name} ({fusion_desc})")
     basemodel = ModelClass(args.causal, args.lora, args.ln_grad, args.llm_layers)
     
     ocean_data_dir = './data/stdplm_input_025'
@@ -592,6 +579,9 @@ if __name__ == '__main__':
     LOG_DIR = os.path.join(args.log_root, f'{safe_time_str}_{args.desc}_{random_str()}')
     check_dir(LOG_DIR, mkdir=True)
     mylogger = getlogger(os.path.join(LOG_DIR, 'experiments.log'))
+    mylogger.info(f"Base model: {model_name}")
+    mylogger.info(f"Fusion mode: {fusion_mode_name} ({fusion_desc})")
+    mylogger.info(f"Cross-modal QKV attention enabled: {using_qkv_attention}")
 
     output_len = args.predict_len
     if args.task == 'all': output_len += args.sample_len
