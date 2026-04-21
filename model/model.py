@@ -133,6 +133,89 @@ class Node2Token_Independent(nn.Module):
         out = self.ln(state + x)
         return out
 
+
+class Node2Token_MultiScaleCNN(nn.Module):
+    """
+    Multi-scale CNN tokenizer.
+    - Spatial path: (B,T,C,H,W) -> Conv2d branches -> (B,N,emb_dim)
+    - Legacy path: (B,N,T*C) -> Conv1d branches -> (B,N,emb_dim)
+    """
+    def __init__(self, sample_len, feature_dim, node_emb_dim, emb_dim, tim_dim, dropout, use_node_embedding):
+        super().__init__()
+        self.sample_len = sample_len
+        self.feature_dim = feature_dim
+        self.emb_dim = emb_dim
+        self.use_node_embedding = use_node_embedding
+
+        in_ch = feature_dim * 2  # x + mask
+        half = emb_dim // 2
+        rest = emb_dim - half
+
+        # Spatial multi-scale branches
+        self.spatial_k3 = nn.Sequential(
+            nn.Conv2d(in_ch, half, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.spatial_k7 = nn.Sequential(
+            nn.Conv2d(in_ch, rest, kernel_size=7, padding=3),
+            nn.GELU(),
+        )
+
+        # Legacy (flattened) temporal branches
+        self.temporal_k3 = nn.Sequential(
+            nn.Conv1d(in_ch, half, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.temporal_k5 = nn.Sequential(
+            nn.Conv1d(in_ch, rest, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+
+        state_features = tim_dim + (node_emb_dim if use_node_embedding else 0)
+        self.state_fc = nn.Sequential(
+            nn.Linear(state_features, node_emb_dim),
+            nn.ReLU(),
+            nn.Linear(node_emb_dim, emb_dim),
+        )
+        self.out_ln = nn.LayerNorm(emb_dim)
+
+    def _state_token(self, te, ne, B, N):
+        state = te[:, -1:, :].repeat(1, N, 1)
+        if self.use_node_embedding:
+            ne = torch.unsqueeze(ne, dim=0).repeat(B, 1, 1)
+            state = torch.concat((state, ne), dim=-1)
+        return self.state_fc(state)
+
+    def _legacy_tokenize(self, x, mask):
+        B, N, TF = x.shape
+        x4 = x.contiguous().view(B, N, self.sample_len, self.feature_dim).permute(0, 1, 3, 2)  # (B,N,C,T)
+        m4 = mask.contiguous().view(B, N, self.sample_len, self.feature_dim).permute(0, 1, 3, 2)
+        z = torch.concat((x4, m4), dim=2).contiguous().view(B * N, self.feature_dim * 2, self.sample_len)
+
+        y = torch.concat((self.temporal_k3(z), self.temporal_k5(z)), dim=1)  # (B*N,emb,T)
+        y = y.mean(dim=-1).view(B, N, self.emb_dim)
+        return y
+
+    def _spatial_tokenize(self, x_spatial, mask_spatial):
+        # x_spatial/mask_spatial: (B,T,C,H,W)
+        B, T, C, H, W = x_spatial.shape
+        z = torch.concat((x_spatial, mask_spatial), dim=2).contiguous().view(B * T, C * 2, H, W)
+
+        y = torch.concat((self.spatial_k3(z), self.spatial_k7(z)), dim=1)  # (B*T,emb,H,W)
+        y = y.view(B, T, self.emb_dim, H, W).mean(dim=1)  # (B,emb,H,W)
+        y = y.permute(0, 2, 3, 1).contiguous().view(B, H * W, self.emb_dim)
+        return y
+
+    def forward(self, x, te, ne, mask, x_spatial=None, mask_spatial=None):
+        B, N, _ = x.shape
+        if x_spatial is not None and mask_spatial is not None:
+            token = self._spatial_tokenize(x_spatial, mask_spatial)
+        else:
+            token = self._legacy_tokenize(x, mask)
+
+        state = self._state_token(te, ne, B, N)
+        return self.out_ln(state + token)
+
 class DecodingLayer(nn.Module):
     def __init__(self, emb_dim, output_dim):
         super().__init__()
@@ -237,11 +320,11 @@ class STALLM_MIMO(nn.Module):
         self.dims = {'flow': 2, 'wave': 4, 'wind': 2} 
 
         # 2. 為每一組物理量配置獨立的編碼器
-        from model.model import Node2Token_Independent, TimeEmbedding, NodeEmbedding, DecodingLayer
+        from model.model import Node2Token_MultiScaleCNN, TimeEmbedding, NodeEmbedding, DecodingLayer
         
-        self.tokenizer_flow = Node2Token_Independent(sample_len, self.dims['flow'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
-        self.tokenizer_wave = Node2Token_Independent(sample_len, self.dims['wave'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
-        self.tokenizer_wind = Node2Token_Independent(sample_len, self.dims['wind'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
+        self.tokenizer_flow = Node2Token_MultiScaleCNN(sample_len, self.dims['flow'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
+        self.tokenizer_wave = Node2Token_MultiScaleCNN(sample_len, self.dims['wave'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
+        self.tokenizer_wind = Node2Token_MultiScaleCNN(sample_len, self.dims['wind'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
         
         # 3. 空間壓縮與物理對齊模塊 (以 Flow 為核心，Wind/Wave 為背景)
         if use_sandglassAttn:
@@ -270,10 +353,15 @@ class STALLM_MIMO(nn.Module):
 
     def forward(self, x, timestamp, prompt_prefix, mask):
         # Commit-1 adapter: accept both legacy 3D input and new 5D grid input.
+        x_spatial = None
+        m_spatial = None
         if x.ndim == 5:
             # x/mask: (B, T, C, H, W) -> legacy (B, N, T*C)
             B, T, C, H, W = x.shape
             N = H * W
+            x_spatial = x[:, :self.sample_len]
+            if mask is not None and mask.ndim == 5:
+                m_spatial = mask[:, :self.sample_len]
             x_flat = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N, T * C)
             if mask is None:
                 mask_flat = torch.ones_like(x_flat)
@@ -317,9 +405,14 @@ class STALLM_MIMO(nn.Module):
         ne = self.node_embd_layer() if self.use_node_embedding else None
 
         # 獨立編碼
-        tokens_f = self.tokenizer_flow(x_f, te, ne, m_f)
-        tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa)
-        tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
+        if x_spatial is not None and m_spatial is not None:
+            tokens_f = self.tokenizer_flow(x_f, te, ne, m_f, x_spatial=x_spatial[:, :, [0, 1], :, :], mask_spatial=m_spatial[:, :, [0, 1], :, :])
+            tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa, x_spatial=x_spatial[:, :, [2, 3, 4, 5], :, :], mask_spatial=m_spatial[:, :, [2, 3, 4, 5], :, :])
+            tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi, x_spatial=x_spatial[:, :, [6, 7], :, :], mask_spatial=m_spatial[:, :, [6, 7], :, :])
+        else:
+            tokens_f = self.tokenizer_flow(x_f, te, ne, m_f)
+            tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa)
+            tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
 
         # 动态融合 + 独立后半程
         if self.use_sandglassAttn:
