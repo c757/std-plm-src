@@ -145,6 +145,14 @@ def _unpack_model_output(model_output):
     return model_output, [], {}
 
 
+def _flatten_btchw_to_btnf(x):
+    # (B, T, C, H, W) -> (B, T, N, F=C)
+    if x.ndim != 5:
+        return x
+    b, t, c, h, w = x.shape
+    return x.permute(0, 1, 3, 4, 2).contiguous().view(b, t, h * w, c)
+
+
 def _init_training_history(chosen_vars):
     history = {
         'train_loss': {'x': [], 'y': []},
@@ -336,9 +344,20 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
     for input, target, timestamp, cond_mask, ob_mask in loader:
         input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
         cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
-        B, T, N, F = input.shape
+        model_input = torch.where(cond_mask == 0, 0, input)
 
-        input_data = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+        if model_input.ndim == 5:
+            # Commit-1 bridge: keep 5D tensor for model adapter path.
+            input_data = model_input
+            target_btnf = _flatten_btchw_to_btnf(target)
+            ob_mask_btnf = _flatten_btchw_to_btnf(ob_mask)
+            B, _, N, _ = target_btnf.shape
+        else:
+            B, T, N, F = model_input.shape
+            input_data = model_input.permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+            target_btnf = target
+            ob_mask_btnf = ob_mask
+
         # Use AMP autocast in forward if requested
         if getattr(args, 'fp16', False):
             with torch.amp.autocast(device_type='cuda'):
@@ -356,8 +375,8 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
         for var in chosen_vars:
             idx = scaler.var_indices[var]
             pred = predict_dict[var].view(B, N, -1, len(idx)).permute(0, 2, 1, 3).contiguous()
-            targ_sub = target[:, -args.predict_len:, :, idx]
-            mask_sub = ob_mask[:, -args.predict_len:, :, idx].bool()
+            targ_sub = target_btnf[:, -args.predict_len:, :, idx]
+            mask_sub = ob_mask_btnf[:, -args.predict_len:, :, idx].bool()
 
             for i in range(len(idx)):
                 p_ch = pred[..., i]
@@ -398,9 +417,19 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
         for input, target, timestamp, cond_mask, ob_mask in loader:
             input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
             cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
-            B, T, N, F = input.shape
+            model_input = torch.where(cond_mask == 0, 0, input)
 
-            input_proc = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+            if model_input.ndim == 5:
+                input_proc = model_input
+                target_btnf = _flatten_btchw_to_btnf(target)
+                ob_mask_btnf = _flatten_btchw_to_btnf(ob_mask)
+                B, _, N, _ = target_btnf.shape
+            else:
+                B, T, N, F = model_input.shape
+                input_proc = model_input.permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+                target_btnf = target
+                ob_mask_btnf = ob_mask
+
             if getattr(args, 'fp16', False):
                 with torch.amp.autocast(device_type='cuda'):
                     predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
@@ -414,8 +443,8 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
                 
                 # 独立物理反归一化，评价真实量级误差
                 pred_phys = scaler.inverse_transform(pred, var)
-                targ_phys = scaler.inverse_transform(target[:, -args.predict_len:, :, idx], var)
-                mask_sub = ob_mask[:, -args.predict_len:, :, idx].bool()
+                targ_phys = scaler.inverse_transform(target_btnf[:, -args.predict_len:, :, idx], var)
+                mask_sub = ob_mask_btnf[:, -args.predict_len:, :, idx].bool()
 
                 storage[var]["preds"].append(pred_phys.detach())
                 storage[var]["targs"].append(targ_phys.detach())

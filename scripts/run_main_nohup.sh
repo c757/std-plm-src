@@ -1,4 +1,4 @@
-echo "$PID" > "$LOG_DIR/pid.txt"
+
 #!/usr/bin/env bash
 set -euo pipefail
 

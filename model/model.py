@@ -269,9 +269,27 @@ class STALLM_MIMO(nn.Module):
             self.node_embd_layer = NodeEmbedding(node_embeddings, node_emb_dim, trunc_k, dropout)
 
     def forward(self, x, timestamp, prompt_prefix, mask):
-        B, N, TF = x.shape 
-        x_reshaped = x.view(B, N, self.sample_len, -1)
-        mask_reshaped = mask.view(B, N, self.sample_len, -1)
+        # Commit-1 adapter: accept both legacy 3D input and new 5D grid input.
+        if x.ndim == 5:
+            # x/mask: (B, T, C, H, W) -> legacy (B, N, T*C)
+            B, T, C, H, W = x.shape
+            N = H * W
+            x_flat = x.permute(0, 3, 4, 1, 2).contiguous().view(B, N, T * C)
+            if mask is None:
+                mask_flat = torch.ones_like(x_flat)
+            elif mask.ndim == 5:
+                mask_flat = mask.permute(0, 3, 4, 1, 2).contiguous().view(B, N, T * C)
+            else:
+                mask_flat = mask
+        elif x.ndim == 3:
+            B, N, TF = x.shape
+            x_flat = x
+            mask_flat = mask if mask is not None else torch.ones_like(x_flat)
+        else:
+            raise ValueError(f"Unsupported input ndim={x.ndim}, expected 3 or 5")
+
+        x_reshaped = x_flat.view(B, N, self.sample_len, -1)
+        mask_reshaped = mask_flat.view(B, N, self.sample_len, -1)
         
         # 💡 物理索引精確切片 (对齐 8 维新数据)
         x_f_4d = x_reshaped[..., [0, 1]].contiguous()
