@@ -5,13 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, Optional, Tuple, Union
 from utils.utils import norm_Adj, lap_eig, topological_sort
-from model.sandglassAttn import SAG, CrossModalityAlignment
+# from model.sandglassAttn import SAG, CrossModalityAlignment
+from model.topology_gcn import TopologyGCNBridge
 from model.RevIN import RevIN
 import numpy as np
 from model.position import PositionalEncoding
+
+
 class TimeEmbedding(nn.Module):
 
-    def __init__(self,t_dim):
+    def __init__(self, t_dim):
         super().__init__()
 
         # 周期函数时间编码（重点覆盖潮汐周期）
@@ -34,15 +37,14 @@ class TimeEmbedding(nn.Module):
         )
         self.ln = nn.LayerNorm(t_dim * 2)
 
-    def forward(self,TE):
-
+    def forward(self, TE):
         # TE (B,T,5)
 
-        B,T,_ = TE.shape
+        B, T, _ = TE.shape
 
-        week = (TE[...,2].to(torch.long) % 7).view(B*T,-1)
-        hour = (TE[...,3].to(torch.long) % 24).view(B*T,-1)
-        minute = (TE[...,4].to(torch.long) % 60).view(B*T,-1)
+        week = (TE[..., 2].to(torch.long) % 7).view(B * T, -1)
+        hour = (TE[..., 3].to(torch.long) % 24).view(B * T, -1)
+        minute = (TE[..., 4].to(torch.long) % 60).view(B * T, -1)
 
         # 以“周内分钟”构造连续时间，相比固定 slot 更易建模潮汐相位漂移
         t_minutes = (week * 24 * 60 + hour * 60 + minute).float()  # (B*T, 1)
@@ -67,38 +69,42 @@ class NodeEmbedding(nn.Module):
     def forward(self):
         node_emgedding = self.fc(self.lap_eigvec)
         return node_emgedding
-    
+
     # 注意：原本这里还有一个 setadj(self, adj_mx) 方法，彻底删掉它！
-    
+
+
 class Time2Token(nn.Module):
-    def __init__(self,sample_len, features, emb_dim, tim_dim, dropout):
+    def __init__(self, sample_len, features, emb_dim, tim_dim, dropout):
         super().__init__()
-        
+
         self.sample_len = sample_len
 
-        in_features =  sample_len*features*2 + tim_dim
-        hidden_size = (in_features + emb_dim)*2//3
+        in_features = sample_len * features * 2 + tim_dim
+        hidden_size = (in_features + emb_dim) * 2 // 3
         self.fc_state = nn.Sequential(
             nn.Linear(in_features, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, emb_dim),
         )
 
-        input_dim = tim_dim + (sample_len-1)*features*2
-        hidden_size = (input_dim+emb_dim)*2//3
+        input_dim = tim_dim + (sample_len - 1) * features * 2
+        hidden_size = (input_dim + emb_dim) * 2 // 3
         self.fc_grad = nn.Sequential(
             nn.Linear(input_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, emb_dim),
-        )        
+        )
 
         self.ln = nn.LayerNorm(emb_dim)
+
+
 # 以下直接展示最重要的 MIMO 改造部分：
 
 class Node2Token_Independent(nn.Module):
     """
     为单一物理要素专门定制的 Tokenizer，保证通道独立性（Channel Independence）
     """
+
     def __init__(self, sample_len, feature_dim, node_emb_dim, emb_dim, tim_dim, dropout, use_node_embedding):
         super().__init__()
         in_features = sample_len * feature_dim * 2  # 包含 mask 拼接
@@ -108,18 +114,18 @@ class Node2Token_Independent(nn.Module):
             state_features += node_emb_dim
 
         self.fc1 = nn.Sequential(nn.Linear(in_features, emb_dim))
-        
+
         self.state_fc = nn.Sequential(
             nn.Linear(state_features, node_emb_dim),
             nn.ReLU(),
             nn.Linear(node_emb_dim, emb_dim),
         )
-        self.mask_token = nn.Linear(in_features=sample_len*feature_dim, out_features=emb_dim)
+        self.mask_token = nn.Linear(in_features=sample_len * feature_dim, out_features=emb_dim)
         self.ln = nn.LayerNorm(emb_dim)
 
     def forward(self, x, te, ne, mask):
         B, N, TF = x.shape
-        mask = mask.contiguous().view(B, N, -1) 
+        mask = mask.contiguous().view(B, N, -1)
         x = torch.concat((x, mask), dim=-1)
 
         state = te[:, -1:, :].repeat(1, N, 1)
@@ -140,6 +146,7 @@ class Node2Token_MultiScaleCNN(nn.Module):
     - Spatial path: (B,T,C,H,W) -> Conv2d branches -> (B,N,emb_dim)
     - Legacy path: (B,N,T*C) -> Conv1d branches -> (B,N,emb_dim)
     """
+
     def __init__(self, sample_len, feature_dim, node_emb_dim, emb_dim, tim_dim, dropout, use_node_embedding):
         super().__init__()
         self.sample_len = sample_len
@@ -180,11 +187,14 @@ class Node2Token_MultiScaleCNN(nn.Module):
         self.out_ln = nn.LayerNorm(emb_dim)
 
     def _state_token(self, te, ne, B, N):
-        state = te[:, -1:, :].repeat(1, N, 1)
+        T = te.shape[1]
+        # te: (B, T, tim_dim) -> (B, T, N, tim_dim)
+        state = te.unsqueeze(2).repeat(1, 1, N, 1)
         if self.use_node_embedding:
-            ne = torch.unsqueeze(ne, dim=0).repeat(B, 1, 1)
+            # ne: (N, node_emb_dim) -> (B, T, N, node_emb_dim)
+            ne = ne.unsqueeze(0).unsqueeze(0).repeat(B, T, 1, 1)
             state = torch.concat((state, ne), dim=-1)
-        return self.state_fc(state)
+        return self.state_fc(state)  # (B, T, N, emb_dim)
 
     def _legacy_tokenize(self, x, mask):
         B, N, TF = x.shape
@@ -192,8 +202,9 @@ class Node2Token_MultiScaleCNN(nn.Module):
         m4 = mask.contiguous().view(B, N, self.sample_len, self.feature_dim).permute(0, 1, 3, 2)
         z = torch.concat((x4, m4), dim=2).contiguous().view(B * N, self.feature_dim * 2, self.sample_len)
 
-        y = torch.concat((self.temporal_k3(z), self.temporal_k5(z)), dim=1)  # (B*N,emb,T)
-        y = y.mean(dim=-1).view(B, N, self.emb_dim)
+        y = torch.concat((self.temporal_k3(z), self.temporal_k5(z)), dim=1)  # (B*N, emb, T)
+        y = y.permute(0, 2, 1).contiguous().view(B, N, self.sample_len, self.emb_dim)
+        y = y.permute(0, 2, 1, 3).contiguous()  # (B, T, N, emb_dim)
         return y
 
     def _spatial_tokenize(self, x_spatial, mask_spatial):
@@ -202,19 +213,20 @@ class Node2Token_MultiScaleCNN(nn.Module):
         z = torch.concat((x_spatial, mask_spatial), dim=2).contiguous().view(B * T, C * 2, H, W)
 
         y = torch.concat((self.spatial_k3(z), self.spatial_k7(z)), dim=1)  # (B*T,emb,H,W)
-        y = y.view(B, T, self.emb_dim, H, W).mean(dim=1)  # (B,emb,H,W)
-        y = y.permute(0, 2, 3, 1).contiguous().view(B, H * W, self.emb_dim)
-        return y
+        y = y.view(B, T, self.emb_dim, H, W)
+        y = y.permute(0, 1, 3, 4, 2).contiguous().view(B, T, H * W, self.emb_dim)
+        return y  # (B, T, N, emb_dim)
 
     def forward(self, x, te, ne, mask, x_spatial=None, mask_spatial=None):
         B, N, _ = x.shape
         if x_spatial is not None and mask_spatial is not None:
-            token = self._spatial_tokenize(x_spatial, mask_spatial)
+            token = self._spatial_tokenize(x_spatial, mask_spatial)  # (B, T, N, D)
         else:
-            token = self._legacy_tokenize(x, mask)
+            token = self._legacy_tokenize(x, mask)  # (B, T, N, D)
 
-        state = self._state_token(te, ne, B, N)
-        return self.out_ln(state + token)
+        state = self._state_token(te, ne, B, N)  # (B, T, N, D)
+        return self.out_ln(state + token)  # (B, T, N, D)
+
 
 class DecodingLayer(nn.Module):
     def __init__(self, emb_dim, output_dim):
@@ -225,6 +237,7 @@ class DecodingLayer(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, output_dim),
         )
+
     def forward(self, llm_hidden):
         return self.fc(llm_hidden)
 
@@ -234,6 +247,7 @@ class DynamicTriModalFusion(nn.Module):
     三模态动态融合：每个变量都用自身作为主干，并按余弦相似度动态吸收另外两种变量信息。
     输出保持变量独立（flow/wave/wind 各有各的融合结果），同时显式建模相互影响。
     """
+
     def __init__(self, emb_dim, dropout=0.0, temperature=0.5, mode="cosine"):
         super().__init__()
         if mode not in ("cosine", "qkv"):
@@ -254,11 +268,11 @@ class DynamicTriModalFusion(nn.Module):
     def _fuse_one(self, core, all_states, proj, ln):
         # core: (B, S, D), all_states: list[(B, S, D)]
         sims = [F.cosine_similarity(core, s, dim=-1).unsqueeze(-1) for s in all_states]  # 3 x (B, S, 1)
-        sims = torch.concat(sims, dim=-1) / self.temperature                                # (B, S, 3)
+        sims = torch.concat(sims, dim=-1) / self.temperature  # (B, S, 3)
         weights = torch.softmax(sims, dim=-1)
 
-        stacked = torch.stack(all_states, dim=-2)                                            # (B, S, 3, D)
-        fused = torch.sum(weights.unsqueeze(-1) * stacked, dim=-2)                           # (B, S, D)
+        stacked = torch.stack(all_states, dim=-2)  # (B, S, 3, D)
+        fused = torch.sum(weights.unsqueeze(-1) * stacked, dim=-2)  # (B, S, D)
         out = ln(core + self.dropout(proj(fused)))
         return out, weights
 
@@ -266,12 +280,12 @@ class DynamicTriModalFusion(nn.Module):
         # core: (B, S, D), all_states: list[(B, S, D)]
         stacked = torch.stack(all_states, dim=-2)  # (B, S, 3, D)
 
-        q = self.q_proj[idx](core).unsqueeze(-2)   # (B, S, 1, D)
-        k = self.k_proj[idx](stacked)              # (B, S, 3, D)
-        v = self.v_proj[idx](stacked)              # (B, S, 3, D)
+        q = self.q_proj[idx](core).unsqueeze(-2)  # (B, S, 1, D)
+        k = self.k_proj[idx](stacked)  # (B, S, 3, D)
+        v = self.v_proj[idx](stacked)  # (B, S, 3, D)
 
         scores = torch.sum(q * k, dim=-1) * self.scale
-        weights = torch.softmax(scores, dim=-1)    # (B, S, 3)
+        weights = torch.softmax(scores, dim=-1)  # (B, S, 3)
         fused = torch.sum(weights.unsqueeze(-1) * v, dim=-2)  # (B, S, D)
 
         out = self.ln[idx](core + self.dropout(self.proj[idx](fused)))
@@ -297,42 +311,49 @@ class STALLM_MIMO(nn.Module):
     """
     支持物理分群（流、浪、風）的多輸入多輸出時空架構
     """
+
     def __init__(self, basemodel, sample_len, output_len,
-                 input_dim, output_dim, node_emb_dim, sag_dim, sag_tokens,
+                 input_dim, output_dim, node_emb_dim,
                  node_embeddings=None, use_node_embedding=True,
-                 use_timetoken=True, use_sandglassAttn=True,
+                 # use_timetoken=True, use_sandglassAttn=True,
+                 use_timetoken=True, use_gcn=True,
                  dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine",
-                 use_revin=False, revin_affine=True): 
+                 use_revin=False, revin_affine=True, edge_index=None):
         super().__init__()
-        
+
         self.sample_len = sample_len
         self.output_len = output_len
         self.emb_dim = basemodel.emb_dim
         self.basemodel = basemodel
-        self.use_sandglassAttn = use_sandglassAttn
+        # self.use_sandglassAttn = use_sandglassAttn
+        self.use_gcn = use_gcn
         self.use_node_embedding = use_node_embedding
         self.fusion_mode = fusion_mode
         self.use_revin = use_revin
-        
+
         tim_dim = t_dim * 2
-        
+
         # 1. 物理維度定義 (根據 clear.py 的 0,1 | 2,3,4,5 | 6,7 分佈)
-        self.dims = {'flow': 2, 'wave': 4, 'wind': 2} 
+        self.dims = {'flow': 2, 'wave': 4, 'wind': 2}
 
         # 2. 為每一組物理量配置獨立的編碼器
         from model.model import Node2Token_MultiScaleCNN, TimeEmbedding, NodeEmbedding, DecodingLayer
-        
-        self.tokenizer_flow = Node2Token_MultiScaleCNN(sample_len, self.dims['flow'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
-        self.tokenizer_wave = Node2Token_MultiScaleCNN(sample_len, self.dims['wave'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
-        self.tokenizer_wind = Node2Token_MultiScaleCNN(sample_len, self.dims['wind'], node_emb_dim, self.emb_dim, tim_dim, dropout, use_node_embedding)
-        
-        # 3. 空間壓縮與物理對齊模塊 (以 Flow 為核心，Wind/Wave 為背景)
-        if use_sandglassAttn:
-            self.sag_flow = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['flow'], dropout)
-            self.sag_wave = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wave'], dropout)
-            self.sag_wind = SAG(sag_dim, sag_tokens, self.emb_dim, sample_len, self.dims['wind'], dropout)
 
-        # 新增：三模态动态融合（无论是否启用 SAG，都可在当前 token 空间融合）
+        self.tokenizer_flow = Node2Token_MultiScaleCNN(sample_len, self.dims['flow'], node_emb_dim, self.emb_dim,
+                                                       tim_dim, dropout, use_node_embedding)
+        self.tokenizer_wave = Node2Token_MultiScaleCNN(sample_len, self.dims['wave'], node_emb_dim, self.emb_dim,
+                                                       tim_dim, dropout, use_node_embedding)
+        self.tokenizer_wind = Node2Token_MultiScaleCNN(sample_len, self.dims['wind'], node_emb_dim, self.emb_dim,
+                                                       tim_dim, dropout, use_node_embedding)
+
+        # 3. 拓扑感知空间传导模块（GCN）
+        # if use_sandglassAttn:
+        if use_gcn:
+            self.gcn_flow = TopologyGCNBridge(self.emb_dim, edge_index=edge_index, dropout=dropout)
+            self.gcn_wave = TopologyGCNBridge(self.emb_dim, edge_index=edge_index, dropout=dropout)
+            self.gcn_wind = TopologyGCNBridge(self.emb_dim, edge_index=edge_index, dropout=dropout)
+
+        # 三模态动态融合（无论是否启用 GCN，都在 token 空间融合）
         self.dynamic_fusion = DynamicTriModalFusion(self.emb_dim, dropout=dropout, mode=fusion_mode)
 
         # 4. 並行多頭解碼器
@@ -378,15 +399,15 @@ class STALLM_MIMO(nn.Module):
 
         x_reshaped = x_flat.view(B, N, self.sample_len, -1)
         mask_reshaped = mask_flat.view(B, N, self.sample_len, -1)
-        
+
         # 💡 物理索引精確切片 (对齐 8 维新数据)
         x_f_4d = x_reshaped[..., [0, 1]].contiguous()
         m_f = mask_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
-        
+
         # 波浪增加第 5 维 (包含 sin 和 cos)
         x_wa_4d = x_reshaped[..., [2, 3, 4, 5]].contiguous()
         m_wa = mask_reshaped[..., [2, 3, 4, 5]].contiguous().view(B, N, -1)
-        
+
         # 海风被挤到了第 6, 7 维
         x_wi_4d = x_reshaped[..., [6, 7]].contiguous()
         m_wi = mask_reshaped[..., [6, 7]].contiguous().view(B, N, -1)
@@ -406,47 +427,89 @@ class STALLM_MIMO(nn.Module):
 
         # 獨立編碼
         if x_spatial is not None and m_spatial is not None:
-            tokens_f = self.tokenizer_flow(x_f, te, ne, m_f, x_spatial=x_spatial[:, :, [0, 1], :, :], mask_spatial=m_spatial[:, :, [0, 1], :, :])
-            tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa, x_spatial=x_spatial[:, :, [2, 3, 4, 5], :, :], mask_spatial=m_spatial[:, :, [2, 3, 4, 5], :, :])
-            tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi, x_spatial=x_spatial[:, :, [6, 7], :, :], mask_spatial=m_spatial[:, :, [6, 7], :, :])
+            tokens_f = self.tokenizer_flow(x_f, te, ne, m_f, x_spatial=x_spatial[:, :, [0, 1], :, :],
+                                           mask_spatial=m_spatial[:, :, [0, 1], :, :])
+            tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa, x_spatial=x_spatial[:, :, [2, 3, 4, 5], :, :],
+                                            mask_spatial=m_spatial[:, :, [2, 3, 4, 5], :, :])
+            tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi, x_spatial=x_spatial[:, :, [6, 7], :, :],
+                                            mask_spatial=m_spatial[:, :, [6, 7], :, :])
         else:
             tokens_f = self.tokenizer_flow(x_f, te, ne, m_f)
             tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa)
             tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
 
         # 动态融合 + 独立后半程
-        if self.use_sandglassAttn:
-            s_f, _ = self.sag_flow.encode(tokens_f)
-            s_wa, _ = self.sag_wave.encode(tokens_wa)
-            s_wi, _ = self.sag_wind.encode(tokens_wi)
+        # if self.use_sandglassAttn:
+        if self.use_gcn:
+            s_f = self.gcn_flow(tokens_f)
+            s_wa = self.gcn_wave(tokens_wa)
+            s_wi = self.gcn_wind(tokens_wi)
 
-            # 每个变量都进行“自己 + 动态加权其他变量”融合
-            (aligned_f, aligned_wa, aligned_wi), weight_dict = self.dynamic_fusion(s_f, s_wa, s_wi)
+            # s_f 等是 (B, T, N, D)，fusion 模块期望 (B, S, D)
+            # reshape 为 (B, T*N, D) 送入融合，出来再 reshape 回去
+            B_f, T_f, N_f, D_f = s_f.shape
+            s_f_2d = s_f.view(B_f, T_f * N_f, D_f)
+            s_wa_2d = s_wa.view(B_f, T_f * N_f, D_f)
+            s_wi_2d = s_wi.view(B_f, T_f * N_f, D_f)
 
-            # 每个变量都独立进入 PLM
-            hidden_f = self.basemodel(aligned_f)
-            hidden_wa = self.basemodel(aligned_wa)
-            hidden_wi = self.basemodel(aligned_wi)
+            (aligned_f_2d, aligned_wa_2d, aligned_wi_2d), weight_dict = self.dynamic_fusion(s_f_2d, s_wa_2d, s_wi_2d)
+            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f)
+            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f)
+            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f)
 
-            # 每个变量都用自己的解码器 + 残差
-            decoded_f = self.sag_flow.decode(hidden_f, tokens_f) + tokens_f
-            decoded_wa = self.sag_wave.decode(hidden_wa, tokens_wa) + tokens_wa
-            decoded_wi = self.sag_wind.decode(hidden_wi, tokens_wi) + tokens_wi
+            # aligned_f/wa/wi: (B, T, N, D)
+            # 让 LLM 沿时间方向处理：reshape 为 (B*N, T, D)
+            B_cur, T_cur, N_cur, D_cur = aligned_f.shape
+
+            def _run_llm(feat):
+                inp = feat.permute(0, 2, 1, 3).contiguous().view(B_cur * N_cur, T_cur, D_cur)
+                out = self.basemodel(inp)
+                return out.view(B_cur, N_cur, T_cur, D_cur).permute(0, 2, 1, 3).contiguous()
+
+            hidden_f = _run_llm(aligned_f)
+            hidden_wa = _run_llm(aligned_wa)
+            hidden_wi = _run_llm(aligned_wi)
+
+            decoded_f = hidden_f + s_f
+            decoded_wa = hidden_wa + s_wa
+            decoded_wi = hidden_wi + s_wi
         else:
-            (aligned_f, aligned_wa, aligned_wi), weight_dict = self.dynamic_fusion(tokens_f, tokens_wa, tokens_wi)
+            B_f, T_f, N_f, D_f = tokens_f.shape
+            t_f_2d = tokens_f.view(B_f, T_f * N_f, D_f)
+            t_wa_2d = tokens_wa.view(B_f, T_f * N_f, D_f)
+            t_wi_2d = tokens_wi.view(B_f, T_f * N_f, D_f)
 
-            hidden_f = self.basemodel(aligned_f)
-            hidden_wa = self.basemodel(aligned_wa)
-            hidden_wi = self.basemodel(aligned_wi)
+            (aligned_f_2d, aligned_wa_2d, aligned_wi_2d), weight_dict = self.dynamic_fusion(t_f_2d, t_wa_2d, t_wi_2d)
 
-            # 无 SAG 时直接残差
+            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f)
+            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f)
+            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f)
+
+            B_cur, T_cur, N_cur, D_cur = aligned_f.shape
+
+            def _run_llm(feat):
+                inp = feat.permute(0, 2, 1, 3).contiguous().view(B_cur * N_cur, T_cur, D_cur)
+                out = self.basemodel(inp)
+                return out.view(B_cur, N_cur, T_cur, D_cur).permute(0, 2, 1, 3).contiguous()
+
+            hidden_f = _run_llm(aligned_f)
+            hidden_wa = _run_llm(aligned_wa)
+            hidden_wi = _run_llm(aligned_wi)
+
             decoded_f = hidden_f + tokens_f
             decoded_wa = hidden_wa + tokens_wa
             decoded_wi = hidden_wi + tokens_wi
-        
-        pred_flow = self.head_flow(decoded_f).view(B, N, self.output_len, self.dims['flow'])
-        pred_wave = self.head_wave(decoded_wa).view(B, N, self.output_len, self.dims['wave'])
-        pred_wind = self.head_wind(decoded_wi).view(B, N, self.output_len, self.dims['wind'])
+
+        # decoded: (B, T, N, D) -> 取最后一个时间步作为预测起点
+        # 这与 LLM 自回归输出习惯一致：用序列末尾 token 做预测
+        def _decode(decoded, head, out_len, feat_dim):
+            # 取最后一个时间步: (B, T, N, D) -> (B, N, D)
+            last = decoded[:, -1, :, :]
+            return head(last).view(B, N, out_len, feat_dim)
+
+        pred_flow = _decode(decoded_f, self.head_flow, self.output_len, self.dims['flow'])
+        pred_wave = _decode(decoded_wa, self.head_wave, self.output_len, self.dims['wave'])
+        pred_wind = _decode(decoded_wi, self.head_wind, self.output_len, self.dims['wind'])
 
         # RevIN 反归一化：将预测恢复到输入窗口对应的原始尺度
         if self.use_revin:
@@ -464,10 +527,12 @@ class STALLM_MIMO(nn.Module):
         total = sum(p.numel() for p in self.parameters()) + sum(p.numel() for p in self.buffers())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total, trainable
-    
 
     def grad_state_dict(self):
         return {n: p.detach() for n, p in self.named_parameters() if p.requires_grad}
 
-    def save(self, path:str): torch.save(self.grad_state_dict(), path)
-    def load(self, path:str): self.load_state_dict(torch.load(path), strict=False)
+    def save(self, path: str):
+        torch.save(self.grad_state_dict(), path)
+
+    def load(self, path: str):
+        self.load_state_dict(torch.load(path), strict=False)

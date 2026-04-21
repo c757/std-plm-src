@@ -6,6 +6,30 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
 import os
 
+
+def load_ocean_edge_index(data_dir, add_self_loops=True, bidirectional=True):
+    """Load graph edges from ocean_adj.csv as a 2xE torch long tensor."""
+    edges = pd.read_csv(f'{data_dir}/ocean_adj.csv')
+    src = edges['from'].to_numpy(dtype=np.int64)
+    dst = edges['to'].to_numpy(dtype=np.int64)
+
+    if bidirectional:
+        rev_src = dst
+        rev_dst = src
+        src = np.concatenate([src, rev_src], axis=0)
+        dst = np.concatenate([dst, rev_dst], axis=0)
+
+    if add_self_loops:
+        import json
+        with open(f'{data_dir}/meta.json', 'r') as f:
+            n_nodes = json.load(f)['n_nodes']
+        idx = np.arange(n_nodes, dtype=np.int64)
+        src = np.concatenate([src, idx], axis=0)
+        dst = np.concatenate([dst, idx], axis=0)
+
+    edge_index = np.stack([src, dst], axis=0)
+    return torch.tensor(edge_index, dtype=torch.long)
+
 def load_ocean_laplacian_embeddings(data_dir, K=64):
     print("正在计算稀疏拉普拉斯拓扑嵌入...")
     import json
@@ -104,7 +128,8 @@ class OceanDataset(Dataset):
         
         return x, y, timestamp, cond_mask, ob_mask
 
-def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='node'):
+def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='node',
+                          expected_sample_len=None, expected_predict_len=None):
     data_nodes_path = f'{data_dir}/data_nodes.npy'
     data_grid_path = f'{data_dir}/data_grid.npy'
     layout = (input_layout or 'node').lower()
@@ -133,6 +158,17 @@ def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='
     import json
     with open(f'{data_dir}/meta.json', 'r') as f:
         meta = json.load(f)
+
+    if expected_sample_len is not None and int(meta['sample_len']) != int(expected_sample_len):
+        raise ValueError(
+            f"sample_len mismatch: meta.json={meta['sample_len']} vs args={expected_sample_len}. "
+            "Please regenerate data or align runtime args."
+        )
+    if expected_predict_len is not None and int(meta['predict_len']) != int(expected_predict_len):
+        raise ValueError(
+            f"predict_len mismatch: meta.json={meta['predict_len']} vs args={expected_predict_len}. "
+            "Please regenerate data or align runtime args."
+        )
 
     print(f'[DataLoader] input_layout={layout}, using file: {os.path.basename(data_path)}')
     

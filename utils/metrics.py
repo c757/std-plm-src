@@ -93,3 +93,19 @@ def cal_metrics(predicts,targets,eval_mask):
         mape_20.append(_safe_apply(MAPE_torch, predicts[...,f][mask], targets[...,f][mask]))  
 
     return mae,rmse,mape,acc,mape_10,mape_20
+
+def VRMSE_torch(pred_u, pred_v, true_u, true_v, mask_value=None):
+    """
+    矢量均方根误差：RMSE of vector magnitude error
+    pred_u/v, true_u/v: same shape tensors
+    """
+    if mask_value is not None:
+        mag_true = torch.sqrt(true_u ** 2 + true_v ** 2)
+        mask = torch.gt(mag_true, mask_value)
+        pred_u = torch.masked_select(pred_u, mask)
+        pred_v = torch.masked_select(pred_v, mask)
+        true_u = torch.masked_select(true_u, mask)
+        true_v = torch.masked_select(true_v, mask)
+    err_u = pred_u - true_u
+    err_v = pred_v - true_v
+    return torch.sqrt(torch.mean(err_u ** 2 + err_v ** 2))

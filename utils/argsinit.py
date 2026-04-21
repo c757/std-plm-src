@@ -31,10 +31,11 @@ def AddModelArgs(parser):
 
     parser.add_argument("--node_emb_dim", default=128, type=int)
 
-    parser.add_argument("--sandglassAttn", action="store_true")
+    parser.add_argument("--use_gcn", action="store_true",
+                        help="Enable topology GCN spatial propagation")
     parser.add_argument("--wo_conloss" , action="store_true")
-    parser.add_argument("--sag_dim", default=128, type=int)
-    parser.add_argument("--sag_tokens", default=128, type=int)
+    # parser.add_argument("--sag_dim", default=128, type=int)
+    # parser.add_argument("--sag_tokens", default=128, type=int)
     parser.add_argument("--fusion_mode", default="cosine", choices=["cosine", "qkv"], type=str,
                         help="Tri-modal dynamic fusion mode")
     parser.add_argument("--revin", action="store_true", help="Use RevIN per input window")
