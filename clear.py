@@ -169,16 +169,28 @@ del data_grid # 释放正确的变量
 gc.collect()
 
 # ==========================================
-# 第五部分：构建图邻接矩阵与元数据 (极速版)
+# 第五部分：构建图邻接矩阵与元数据 (修复物理海岸线拓扑)
 # ==========================================
-print("正在构建稀疏邻接矩阵 CSV（极速向量化 4-邻接）...")
-# 【修复4】：用矩阵切片代替 for 循环，瞬间完成 6 万节点的连线
-grid = np.arange(n_nodes).reshape(n_lat, n_lon)
-rows = np.concatenate([grid[:, :-1].flatten(), grid[:, 1:].flatten(), grid[:-1, :].flatten(), grid[1:, :].flatten()])
-cols = np.concatenate([grid[:, 1:].flatten(), grid[:, :-1].flatten(), grid[1:, :].flatten(), grid[:-1, :].flatten()])
-dist = np.ones_like(rows, dtype=np.float32)
+print("正在构建稀疏邻接矩阵 CSV（依据真实的海洋掩码裁剪边）...")
 
-pd.DataFrame({'from': rows, 'to': cols, 'cost': dist}).to_csv(f'{out_dir}/ocean_adj.csv', index=False)
+# 1. 依然使用极速向量化获取全量 4-邻接边
+grid = np.arange(n_nodes).reshape(n_lat, n_lon)
+rows_raw = np.concatenate([grid[:, :-1].flatten(), grid[:, 1:].flatten(), grid[:-1, :].flatten(), grid[1:, :].flatten()])
+cols_raw = np.concatenate([grid[:, 1:].flatten(), grid[:, :-1].flatten(), grid[1:, :].flatten(), grid[:-1, :].flatten()])
+
+# 2. 获取 1D 海洋掩码
+ocean_mask_1d = ocean_mask_2d.flatten()
+
+# 3. 核心修复：只保留 src 和 dst 均为 True (都是海洋) 的连线
+valid_edges_mask = ocean_mask_1d[rows_raw] & ocean_mask_1d[cols_raw]
+
+rows_ocean = rows_raw[valid_edges_mask]
+cols_ocean = cols_raw[valid_edges_mask]
+dist = np.ones_like(rows_ocean, dtype=np.float32)
+
+pd.DataFrame({'from': rows_ocean, 'to': cols_ocean, 'cost': dist}).to_csv(f'{out_dir}/ocean_adj.csv', index=False)
+
+print(f"拓扑裁剪完成：全量边 {len(rows_raw)} 条 -> 有效海洋边 {len(rows_ocean)} 条")
 
 meta = {
     'n_nodes': n_nodes, 'n_lat': n_lat, 'n_lon': n_lon, 'n_features': N_FEAT_NEW,

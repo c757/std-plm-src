@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage:
 #   PYTHON=/path/to/python LOG_ROOT=./logs ./scripts/run_main_nohup.sh KEY=VALUE ...
 # Keys accepted as KEY=VALUE pairs: TASK,MODEL,LLM_LAYERS,BATCH_SIZE,SAMPLE_LEN,PREDICT_LEN,
-# TRUNC_K,EPOCH,VAL_EPOCH,USE_GCN(1/0),NODE_EMBEDDING(1/0),TIME_TOKEN(1/0),FP16(1/0),
+# TRUNC_K,EPOCH,VAL_EPOCH,USE_GCN(1/0),NODE_EMBEDDING(1/0),FP16(1/0),
 # DROPOUT,LR,WEIGHT_DECAY,PATIENCE,FUSION_MODE,LOG_ROOT,PREDICT_VARS,INPUT_LAYOUT,LOG_DIR
 
 # Defaults (can be overridden by environment variables or KEY=VALUE args)
@@ -21,7 +21,6 @@ set -euo pipefail
 : ${VAL_EPOCH:=1}
 : ${USE_GCN:=1}
 : ${NODE_EMBEDDING:=1}
-: ${TIME_TOKEN:=1}
 : ${FP16:=0}
 : ${DROPOUT:=0.2}
 : ${LR:=1e-4}
@@ -64,7 +63,6 @@ CMD+=(--epoch "$EPOCH")
 CMD+=(--val_epoch "$VAL_EPOCH")
 if [ "$USE_GCN" = "1" ] || [ "$USE_GCN" = "true" ]; then CMD+=(--use_gcn); fi
 if [ "$NODE_EMBEDDING" = "1" ] || [ "$NODE_EMBEDDING" = "true" ]; then CMD+=(--node_embedding); fi
-if [ "$TIME_TOKEN" = "1" ] || [ "$TIME_TOKEN" = "true" ]; then CMD+=(--time_token); fi
 if [ "$FP16" = "1" ] || [ "$FP16" = "true" ]; then CMD+=(--fp16); fi
 CMD+=(--dropout "$DROPOUT")
 CMD+=(--lr "$LR")

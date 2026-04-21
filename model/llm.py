@@ -190,7 +190,7 @@ class Transformer(BaseModel):
 
         self.emb_dim = 768
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=12)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=12, batch_first=True)
         self.llm = nn.TransformerEncoder(encoder_layer=encoder_layer,num_layers=3)
 
 

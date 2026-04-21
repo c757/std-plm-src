@@ -712,8 +712,7 @@ if __name__ == '__main__':
                         node_emb_dim=args.node_emb_dim,
                         node_embeddings=node_embeddings, use_node_embedding=args.node_embedding,
                         edge_index=edge_index,
-                        # use_timetoken=args.time_token, use_sandglassAttn=args.sandglassAttn,
-                        use_timetoken=args.time_token, use_gcn=args.use_gcn,
+                        use_gcn=args.use_gcn,
                         dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
                         fusion_mode=args.fusion_mode,
                         use_revin=args.revin, revin_affine=args.revin_affine).to(device)

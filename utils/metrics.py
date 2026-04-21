@@ -30,14 +30,14 @@ def RMSE_torch(pred, true, mask_value=None):
 
 def MAPE_torch(pred, true, mask_value=1e-6):
     if mask_value != None:
-        mask = torch.gt(true, mask_value)
+        mask = torch.gt(torch.abs(true), mask_value)
         pred = torch.masked_select(pred, mask)
         true = torch.masked_select(true, mask)
     return torch.mean(torch.abs(torch.div((true - pred), true)))
 
 def MAPE_torch_node(pred, true, mask_value=1e-6):
     if mask_value != None:
-        mask = torch.gt(true, mask_value)
+        mask = torch.gt(torch.abs(true), mask_value)
         pred = pred*mask
         true = true*mask + (1-mask.float())
         count = mask.sum(dim=-1)

@@ -315,8 +315,7 @@ class STALLM_MIMO(nn.Module):
     def __init__(self, basemodel, sample_len, output_len,
                  input_dim, output_dim, node_emb_dim,
                  node_embeddings=None, use_node_embedding=True,
-                 # use_timetoken=True, use_sandglassAttn=True,
-                 use_timetoken=True, use_gcn=True,
+                 use_gcn=True,
                  dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine",
                  use_revin=False, revin_affine=True, edge_index=None):
         super().__init__()
@@ -371,6 +370,7 @@ class STALLM_MIMO(nn.Module):
         self.timeembedding = TimeEmbedding(t_dim=t_dim)
         if use_node_embedding:
             self.node_embd_layer = NodeEmbedding(node_embeddings, node_emb_dim, trunc_k, dropout)
+            self.llmSpatialProj = nn.Linear(node_emb_dim, self.emb_dim)
 
     def forward(self, x, timestamp, prompt_prefix, mask):
         # Commit-1 adapter: accept both legacy 3D input and new 5D grid input.
@@ -424,6 +424,12 @@ class STALLM_MIMO(nn.Module):
 
         te = self.timeembedding(timestamp[:, :self.sample_len, :])
         ne = self.node_embd_layer() if self.use_node_embedding else None
+        # 新增：预先计算好高维空间提示，准备广播给所有时间步
+        if self.use_node_embedding and ne is not None:
+            # ne: (N, node_emb_dim) -> (N, emb_dim) -> (1, 1, N, emb_dim)
+            spatialHint = self.llmSpatialProj(ne).unsqueeze(0).unsqueeze(1)
+        else:
+            spatialHint = 0
 
         # 獨立編碼
         if x_spatial is not None and m_spatial is not None:
@@ -453,9 +459,9 @@ class STALLM_MIMO(nn.Module):
             s_wi_2d = s_wi.view(B_f, T_f * N_f, D_f)
 
             (aligned_f_2d, aligned_wa_2d, aligned_wi_2d), weight_dict = self.dynamic_fusion(s_f_2d, s_wa_2d, s_wi_2d)
-            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f)
-            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f)
-            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f)
+            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f) + spatialHint
+            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f) + spatialHint
+            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f) + spatialHint
 
             # aligned_f/wa/wi: (B, T, N, D)
             # 让 LLM 沿时间方向处理：reshape 为 (B*N, T, D)
@@ -481,9 +487,9 @@ class STALLM_MIMO(nn.Module):
 
             (aligned_f_2d, aligned_wa_2d, aligned_wi_2d), weight_dict = self.dynamic_fusion(t_f_2d, t_wa_2d, t_wi_2d)
 
-            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f)
-            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f)
-            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f)
+            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f) + spatialHint
+            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f) + spatialHint
+            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f) + spatialHint
 
             B_cur, T_cur, N_cur, D_cur = aligned_f.shape
 
