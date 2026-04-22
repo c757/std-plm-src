@@ -8,7 +8,7 @@ from utils.utils import get_time_str, check_dir, draw_loss_line, draw_mape_node,
 from logger import getlogger
 from model.model import STALLM_MIMO
 from model.llm import Phi2, GPT2, LLAMA3, Transformer, QWEN
-from utils.metrics import MAE_torch, RMSE_torch, MAPE_torch, MAPE_torch_node, cal_metrics
+from utils.metrics import MAE_torch, RMSE_torch, MAPE_torch, MAPE_torch_node, cal_metrics, VRMSE_torch
 from utils.argsinit import InitArgs
 import copy
 from torch.optim.lr_scheduler import ExponentialLR
@@ -21,11 +21,12 @@ import string
 import json
 import csv
 import matplotlib.pyplot as plt
+from contextlib import nullcontext
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
-from utils.ocean_dataloader import get_ocean_dataloaders, load_ocean_laplacian_embeddings
+from utils.ocean_dataloader import get_ocean_dataloaders, load_ocean_laplacian_embeddings, load_ocean_edge_index
 
 # 自动检测计算设备
 if torch.cuda.is_available():
@@ -36,6 +37,50 @@ else:
     device = torch.device("cpu")
 
 print(f"当前使用的计算设备: {device}")
+
+
+def _build_amp_config(args):
+    if not getattr(args, 'fp16', False):
+        return {
+            'enabled': False,
+            'device_type': None,
+            'dtype': None,
+            'use_grad_scaler': False,
+            'reason': 'fp16_disabled'
+        }
+
+    if device.type == 'cuda':
+        return {
+            'enabled': True,
+            'device_type': 'cuda',
+            'dtype': torch.float16,
+            'use_grad_scaler': True,
+            'reason': 'cuda_fp16'
+        }
+
+    if device.type == 'mps':
+        # MPS path uses autocast but not GradScaler.
+        return {
+            'enabled': True,
+            'device_type': 'mps',
+            'dtype': torch.float16,
+            'use_grad_scaler': False,
+            'reason': 'mps_fp16'
+        }
+
+    return {
+        'enabled': False,
+        'device_type': None,
+        'dtype': None,
+        'use_grad_scaler': False,
+        'reason': f'unsupported_device:{device.type}'
+    }
+
+
+def _amp_autocast(amp_cfg):
+    if amp_cfg is not None and amp_cfg.get('enabled', False):
+        return torch.amp.autocast(device_type=amp_cfg['device_type'], dtype=amp_cfg['dtype'])
+    return nullcontext()
 
 random_str = lambda : ''.join(random.sample(string.ascii_letters + string.digits, 6))
 
@@ -108,8 +153,13 @@ def _accumulate_fusion_stats(stats, weight_dict):
         w = weight_dict.get(tgt, None)
         if w is None:
             continue
-        # w: (B, S, 3)
-        w_mean = w.detach().mean(dim=(0, 1)).cpu().tolist()
+        # Support both (B, S, 3) and higher-rank forms such as (B, T, N, 3).
+        if not isinstance(w, torch.Tensor) or w.ndim < 2:
+            continue
+        if w.shape[-1] != len(MODALITY_ORDER):
+            continue
+        reduce_dims = tuple(range(max(w.ndim - 1, 1)))
+        w_mean = w.detach().mean(dim=reduce_dims).cpu().tolist()
         for i, src in enumerate(MODALITY_ORDER):
             stat_map[tgt][src] += float(w_mean[i])
     return stat_map, count + 1
@@ -143,6 +193,14 @@ def _unpack_model_output(model_output):
             pred, other_loss = model_output
             return pred, other_loss, {}
     return model_output, [], {}
+
+
+def _flatten_btchw_to_btnf(x):
+    # (B, T, C, H, W) -> (B, T, N, F=C)
+    if x.ndim != 5:
+        return x
+    b, t, c, h, w = x.shape
+    return x.permute(0, 1, 3, 4, 2).contiguous().view(b, t, h * w, c)
 
 
 def _init_training_history(chosen_vars):
@@ -179,7 +237,7 @@ def _record_fusion_history(history, split, epoch, fusion_stats):
 
 def _record_test_metrics_history(history, epoch, results):
     for var, metrics in results.items():
-        mae, rmse, mape, acc = metrics
+        mae, rmse, mape, acc, *_ = metrics
         history['test_metrics'][var]['mae'].append({'epoch': int(epoch), 'values': [float(x) for x in mae]})
         history['test_metrics'][var]['rmse'].append({'epoch': int(epoch), 'values': [float(x) for x in rmse]})
         history['test_metrics'][var]['mape'].append({'epoch': int(epoch), 'values': [float(x) for x in mape]})
@@ -299,7 +357,7 @@ def _tb_log_test_metrics(writer, epoch, results):
     if writer is None:
         return
     for var, metrics in results.items():
-        mae, rmse, mape, acc = metrics
+        mae, rmse, mape, acc, *_ = metrics
         names = COMPONENT_NAMES.get(var, [f'{var}_{i}' for i in range(len(mae))])
         for i, n in enumerate(names):
             if i < len(mae):
@@ -327,27 +385,34 @@ class OceanScaler:
         s = self.std[idx].view(1, 1, 1, -1)
         return data * s + m
 
-def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool, amp_scaler=None):
+def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool, amp_cfg=None, amp_scaler=None):
     model.train() if need_step else model.eval()
     loss_item, count = 0, 0
     chosen_vars = args.predict_vars.split(',') 
     fusion_stats = _init_fusion_stats()
 
-    for input, target, timestamp, cond_mask, ob_mask in loader:
+    for batch_idx, (input, target, timestamp, cond_mask, ob_mask) in enumerate(loader):
         input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
         cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
-        B, T, N, F = input.shape
+        model_input = torch.where(cond_mask == 0, 0, input)
 
-        input_data = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-        # Use AMP autocast in forward if requested
-        if getattr(args, 'fp16', False):
-            with torch.amp.autocast(device_type='cuda'):
-                predict_dict, other_loss, aux_info = _unpack_model_output(model(input_data, timestamp, prompt_prefix, cond_mask))
+        if model_input.ndim == 5:
+            # Commit-1 bridge: keep 5D tensor for model adapter path.
+            input_data = model_input
+            target_btnf = _flatten_btchw_to_btnf(target)
+            ob_mask_btnf = _flatten_btchw_to_btnf(ob_mask)
+            B, _, N, _ = target_btnf.shape
         else:
+            B, T, N, F = model_input.shape
+            input_data = model_input.permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+            target_btnf = target
+            ob_mask_btnf = ob_mask
+
+        with _amp_autocast(amp_cfg):
             predict_dict, other_loss, aux_info = _unpack_model_output(model(input_data, timestamp, prompt_prefix, cond_mask))
         fusion_stats = _accumulate_fusion_stats(fusion_stats, aux_info.get('fusion_weights', {}))
 
-        total_loss = 0
+        total_loss = None
         valid_channels = 0
 
         # 💡 核心升级：通道级统一标准化 Loss
@@ -356,29 +421,33 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
         for var in chosen_vars:
             idx = scaler.var_indices[var]
             pred = predict_dict[var].view(B, N, -1, len(idx)).permute(0, 2, 1, 3).contiguous()
-            targ_sub = target[:, -args.predict_len:, :, idx]
-            mask_sub = ob_mask[:, -args.predict_len:, :, idx].bool()
+            targ_sub = target_btnf[:, -args.predict_len:, :, idx]
+            mask_sub = ob_mask_btnf[:, -args.predict_len:, :, idx].bool()
 
             for i in range(len(idx)):
                 p_ch = pred[..., i]
                 t_ch = targ_sub[..., i]
                 m_ch = mask_sub[..., i]
                 
-                if m_ch.sum() > 0:
-                    total_loss += loss_fn(p_ch[m_ch], t_ch[m_ch])
+                if m_ch.sum().item() > 0:
+                    ch_loss = loss_fn(p_ch[m_ch], t_ch[m_ch])
+                    total_loss = ch_loss if total_loss is None else (total_loss + ch_loss)
                     valid_channels += 1
 
         # 将所有有效通道的 Loss 平均，做到各要素统一标准化相加
         if valid_channels > 0:
             total_loss = total_loss / valid_channels
+        else:
+            # Skip fully-masked batches to avoid scalar/int fallback issues.
+            continue
 
-        loss_item += total_loss.item(); count += 1
+        loss_item += float(total_loss.detach().item()); count += 1
         
         if need_step:
             optim.zero_grad()
             L = total_loss
             for l in other_loss: L += l
-            if getattr(args, 'fp16', False):
+            if amp_scaler is not None:
                 amp_scaler.scale(L).backward()
                 amp_scaler.step(optim)
                 amp_scaler.update()
@@ -386,9 +455,16 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
                 L.backward()
                 optim.step()
 
+        if (batch_idx + 1) % 100 == 0:
+            total_batches = len(loader)
+            progress = (batch_idx + 1) / total_batches * 100
+            print(
+                f"[Progress: {progress:.1f}%] Batch {batch_idx + 1}/{total_batches} | Current Loss: {total_loss.item():.5f}")
+
+
     return (loss_item / count if count else 0), _finalize_fusion_stats(fusion_stats)
 
-def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=None, amp_scaler=None):
+def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=None, amp_cfg=None, amp_scaler=None):
     model.eval()
     chosen_vars = args.predict_vars.split(',')
     storage = {v: {"preds": [], "targs": [], "masks": []} for v in chosen_vars}
@@ -398,13 +474,20 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
         for input, target, timestamp, cond_mask, ob_mask in loader:
             input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
             cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
-            B, T, N, F = input.shape
+            model_input = torch.where(cond_mask == 0, 0, input)
 
-            input_proc = torch.where(cond_mask == 0, 0, input).permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-            if getattr(args, 'fp16', False):
-                with torch.amp.autocast(device_type='cuda'):
-                    predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
+            if model_input.ndim == 5:
+                input_proc = model_input
+                target_btnf = _flatten_btchw_to_btnf(target)
+                ob_mask_btnf = _flatten_btchw_to_btnf(ob_mask)
+                B, _, N, _ = target_btnf.shape
             else:
+                B, T, N, F = model_input.shape
+                input_proc = model_input.permute(0, 2, 1, 3).contiguous().view(B, N, -1)
+                target_btnf = target
+                ob_mask_btnf = ob_mask
+
+            with _amp_autocast(amp_cfg):
                 predict_dict, _, aux_info = _unpack_model_output(model(input_proc, timestamp, prompt_prefix, cond_mask))
             fusion_stats = _accumulate_fusion_stats(fusion_stats, aux_info.get('fusion_weights', {}))
 
@@ -414,8 +497,8 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
                 
                 # 独立物理反归一化，评价真实量级误差
                 pred_phys = scaler.inverse_transform(pred, var)
-                targ_phys = scaler.inverse_transform(target[:, -args.predict_len:, :, idx], var)
-                mask_sub = ob_mask[:, -args.predict_len:, :, idx].bool()
+                targ_phys = scaler.inverse_transform(target_btnf[:, -args.predict_len:, :, idx], var)
+                mask_sub = ob_mask_btnf[:, -args.predict_len:, :, idx].bool()
 
                 storage[var]["preds"].append(pred_phys.detach())
                 storage[var]["targs"].append(targ_phys.detach())
@@ -426,9 +509,21 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
             all_preds = torch.cat(storage[var]["preds"], 0)
             all_targs = torch.cat(storage[var]["targs"], 0)
             all_masks = torch.cat(storage[var]["masks"], 0)
-            
+
             mae, rmse, mape, acc, _, _ = cal_metrics(all_preds, all_targs, all_masks)
-            results[var] = (mae, rmse, mape, acc)
+
+            # 矢量 RMSE：对有两个分量（u/v）的变量计算
+            vrmse = None
+
+            vector_vars = ['flow', 'wind']
+            if var in vector_vars and all_preds.shape[-1] >= 2:
+                ocean_mask = all_masks[..., 0]
+                vrmse = VRMSE_torch(
+                    all_preds[..., 0][ocean_mask], all_preds[..., 1][ocean_mask],
+                    all_targs[..., 0][ocean_mask], all_targs[..., 1][ocean_mask],
+                ).item()
+
+            results[var] = (mae, rmse, mape, acc, vrmse)
             
             if save and LOG_DIR:
                 save_path = os.path.join(LOG_DIR, f'test_{var}.npz')
@@ -445,10 +540,16 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
     patience_count = 0
     chosen_vars = args.predict_vars.split(',')
     history = _init_training_history(chosen_vars)
+    amp_cfg = _build_amp_config(args)
     amp_scaler = None
-    if getattr(args, 'fp16', False):
+    if amp_cfg['use_grad_scaler']:
         # Use positional 'cuda' for compatibility with current torch version
         amp_scaler = torch.amp.GradScaler('cuda')
+    if getattr(args, 'fp16', False):
+        if amp_cfg['enabled']:
+            mylogger.info(f"[AMP] enabled on {amp_cfg['device_type']} (dtype={amp_cfg['dtype']}, grad_scaler={amp_cfg['use_grad_scaler']})")
+        else:
+            mylogger.warning(f"[AMP] fp16 requested but disabled: {amp_cfg['reason']}")
 
     tb_writer = None
     if getattr(args, 'tensorboard', False):
@@ -461,7 +562,8 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
             mylogger.info(f'[TensorBoard] logging to: {tb_dir}')
 
     for epoch in range(args.epoch):
-        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=True, amp_scaler=amp_scaler)
+        train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler,
+                                              need_step=True, amp_cfg=amp_cfg, amp_scaler=amp_scaler)
         history['train_loss']['x'].append(epoch)
         history['train_loss']['y'].append(float(train_loss))
         _record_fusion_history(history, 'train', epoch, train_fusion)
@@ -473,7 +575,8 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
 
         if epoch % args.val_epoch == 0:
             with torch.no_grad():
-                val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler, need_step=False, amp_scaler=amp_scaler)
+                val_loss, val_fusion = TrainEpoch(args, val_loader, model, optim, loss_fn, prompt_prefix, scaler,
+                                                  need_step=False, amp_cfg=amp_cfg, amp_scaler=amp_scaler)
             history['val_loss']['x'].append(epoch)
             history['val_loss']['y'].append(float(val_loss))
             _record_fusion_history(history, 'val', epoch, val_fusion)
@@ -492,7 +595,7 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
                 patience_count += 1
 
         if epoch % args.test_epoch == 0:
-            res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, amp_scaler=amp_scaler)
+            res, test_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, amp_cfg=amp_cfg, amp_scaler=amp_scaler)
             _record_fusion_history(history, 'test', epoch, test_fusion)
             _record_test_metrics_history(history, epoch, res)
             if tb_writer is not None:
@@ -500,13 +603,15 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
                 _tb_log_test_metrics(tb_writer, epoch, res)
             mylogger.info(f"[Fusion][Test] Epoch {epoch} {_format_fusion_stats(test_fusion)}")
             for var, metrics in res.items():
-                mae, rmse, mape, acc = metrics
+                mae, rmse, mape, acc, vrmse = metrics
+                vrmse_str = f" | VRMSE={_fmt_float(vrmse)}" if vrmse is not None else ""
                 mylogger.info(
                     f"   -> [Test][{var}] Epoch {epoch} "
                     f"{_format_named_metric(mae, var, 'MAE')} | "
                     f"{_format_named_metric(rmse, var, 'RMSE')} | "
                     f"{_format_named_metric(mape, var, 'MAPE')} | "
                     f"{_format_named_metric(acc, var, 'ACC')}"
+                    f"{vrmse_str}"
                 )
 
         if patience_count >= args.patience:
@@ -515,20 +620,24 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
         
     if best_model:
         model.load_state_dict(best_model, strict=False)
-        final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler, save=args.save_result, LOG_DIR=LOG_DIR, amp_scaler=amp_scaler)
+        final_results, final_fusion = TestEpoch(args, test_loader, model, prompt_prefix, scaler,
+                                                save=args.save_result, LOG_DIR=LOG_DIR,
+                                                amp_cfg=amp_cfg, amp_scaler=amp_scaler)
         _record_fusion_history(history, 'final', -1, final_fusion)
         if tb_writer is not None:
             _tb_log_fusion(tb_writer, 'final', 0, final_fusion)
             _tb_log_test_metrics(tb_writer, 0, final_results)
         mylogger.info(f"[Fusion][Final] {_format_fusion_stats(final_fusion)}")
         for var, metrics in final_results.items():
-            mae, rmse, mape, acc = metrics
+            mae, rmse, mape, acc, vrmse = metrics
+            vrmse_str = f" | VRMSE={_fmt_float(vrmse)}" if vrmse is not None else ""
             mylogger.info(
                 f"[Final Best][{var}] "
                 f"{_format_named_metric(mae, var, 'MAE')} | "
                 f"{_format_named_metric(rmse, var, 'RMSE')} | "
                 f"{_format_named_metric(mape, var, 'MAPE')} | "
                 f"{_format_named_metric(acc, var, 'ACC')}"
+                f"{vrmse_str}"
             )
 
     # Persist and visualize history artifacts for post-analysis
@@ -569,11 +678,26 @@ if __name__ == '__main__':
     
     ocean_data_dir = './data/stdplm_input_025'
     # 💡 核心修复：强制设置 num_workers=0，禁止 Windows 多进程复制撑爆内存
-    dataloaders = get_ocean_dataloaders(ocean_data_dir, batch_size=args.batch_size, num_workers=0)
+    dataloaders = get_ocean_dataloaders(
+        ocean_data_dir,
+        batch_size=args.batch_size,
+        num_workers=0,
+        input_layout=args.input_layout,
+        expected_sample_len=args.sample_len,
+        expected_predict_len=args.predict_len,
+    )
     train_loader, val_loader, test_loader = dataloaders['train'], dataloaders['val'], dataloaders['test']
     
     scaler = OceanScaler(f'{ocean_data_dir}/norm_mean.npy', f'{ocean_data_dir}/norm_std.npy', device)
-    node_embeddings = load_ocean_laplacian_embeddings(ocean_data_dir, K=args.trunc_k).to(device)
+    node_embeddings = None
+    if args.node_embedding:
+        print("正在加载节点嵌入...")
+        node_embeddings = load_ocean_laplacian_embeddings(ocean_data_dir, K=args.trunc_k).to(device)
+
+    edge_index = None
+    if args.use_gcn:
+        print("正在加载图边缘索引...")
+        edge_index = load_ocean_edge_index(ocean_data_dir).to(device)
 
     safe_time_str = get_time_str().replace(':', '-')
     LOG_DIR = os.path.join(args.log_root, f'{safe_time_str}_{args.desc}_{random_str()}')
@@ -582,6 +706,11 @@ if __name__ == '__main__':
     mylogger.info(f"Base model: {model_name}")
     mylogger.info(f"Fusion mode: {fusion_mode_name} ({fusion_desc})")
     mylogger.info(f"Cross-modal QKV attention enabled: {using_qkv_attention}")
+    mylogger.info(f"Input layout: {args.input_layout}")
+    mylogger.info("=" * 40 + " Args " + "=" * 40)
+    for k, v in sorted(vars(args).items()):
+        mylogger.info(f"  {k}: {v}")
+    mylogger.info("=" * 86)
 
     output_len = args.predict_len
     if args.task == 'all': output_len += args.sample_len
@@ -595,12 +724,14 @@ if __name__ == '__main__':
 
     model = STALLM_MIMO(basemodel=basemodel, sample_len=args.sample_len, output_len=output_len,
                         input_dim=args.input_dim, output_dim=args.output_dim,
-                        node_emb_dim=args.node_emb_dim, sag_dim=args.sag_dim, sag_tokens=args.sag_tokens,
+                        # node_emb_dim=args.node_emb_dim, sag_dim=args.sag_dim, sag_tokens=args.sag_tokens,
+                        node_emb_dim=args.node_emb_dim,
                         node_embeddings=node_embeddings, use_node_embedding=args.node_embedding,
-                        use_timetoken=args.time_token, use_sandglassAttn=args.sandglassAttn,
+                        edge_index=edge_index,
+                        use_gcn=args.use_gcn,
                         dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
                         fusion_mode=args.fusion_mode,
-                        use_revin=args.revin, revin_affine=args.revin_affine).to(device)
+                        use_revin=args.revin, revin_affine=args.revin_affine,use_fp16=args.fp16).to(device)
 
     total_params, total_trainable_params = model.params_num()
     mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')

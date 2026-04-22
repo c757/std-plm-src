@@ -30,14 +30,14 @@ def RMSE_torch(pred, true, mask_value=None):
 
 def MAPE_torch(pred, true, mask_value=1e-6):
     if mask_value != None:
-        mask = torch.gt(true, mask_value)
+        mask = torch.gt(torch.abs(true), mask_value)
         pred = torch.masked_select(pred, mask)
         true = torch.masked_select(true, mask)
     return torch.mean(torch.abs(torch.div((true - pred), true)))
 
 def MAPE_torch_node(pred, true, mask_value=1e-6):
     if mask_value != None:
-        mask = torch.gt(true, mask_value)
+        mask = torch.gt(torch.abs(true), mask_value)
         pred = pred*mask
         true = true*mask + (1-mask.float())
         count = mask.sum(dim=-1)
@@ -93,3 +93,19 @@ def cal_metrics(predicts,targets,eval_mask):
         mape_20.append(_safe_apply(MAPE_torch, predicts[...,f][mask], targets[...,f][mask]))  
 
     return mae,rmse,mape,acc,mape_10,mape_20
+
+def VRMSE_torch(pred_u, pred_v, true_u, true_v, mask_value=None):
+    """
+    矢量均方根误差：RMSE of vector magnitude error
+    pred_u/v, true_u/v: same shape tensors
+    """
+    if mask_value is not None:
+        mag_true = torch.sqrt(true_u ** 2 + true_v ** 2)
+        mask = torch.gt(mag_true, mask_value)
+        pred_u = torch.masked_select(pred_u, mask)
+        pred_v = torch.masked_select(pred_v, mask)
+        true_u = torch.masked_select(true_u, mask)
+        true_v = torch.masked_select(true_v, mask)
+    err_u = pred_u - true_u
+    err_v = pred_v - true_v
+    return torch.sqrt(torch.mean(err_u ** 2 + err_v ** 2))
