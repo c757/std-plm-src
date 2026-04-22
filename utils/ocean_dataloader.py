@@ -48,7 +48,7 @@ def load_ocean_laplacian_embeddings(data_dir, K=64):
     L = sp.eye(n_nodes) - D_inv_sqrt.dot(A).dot(D_inv_sqrt)
     
     # 【修复1】：使用 sigma=0 的平移反转法，又快又准
-    eigenvalues, eigenvectors = eigsh(L, k=K, which='LM', sigma=0)
+    eigenvalues, eigenvectors = eigsh(L, k=K, which='LM', sigma=-1e-5, ncv=5*K)
     return torch.tensor(eigenvectors, dtype=torch.float32)
     
 class OceanDataset(Dataset):

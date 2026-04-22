@@ -10,6 +10,7 @@ from model.topology_gcn import TopologyGCNBridge
 from model.RevIN import RevIN
 import numpy as np
 from model.position import PositionalEncoding
+from torch.utils.checkpoint import checkpoint
 
 
 class TimeEmbedding(nn.Module):
@@ -271,8 +272,12 @@ class DynamicTriModalFusion(nn.Module):
         sims = torch.concat(sims, dim=-1) / self.temperature  # (B, S, 3)
         weights = torch.softmax(sims, dim=-1)
 
-        stacked = torch.stack(all_states, dim=-2)  # (B, S, 3, D)
-        fused = torch.sum(weights.unsqueeze(-1) * stacked, dim=-2)  # (B, S, D)
+        # 显存优化：废弃 torch.stack，直接逐个矩阵加权相加
+        # 完美规避了在内存中生成 (B, S, 3, D) 这种极其浪费显存的中间变量
+        fused = weights[..., 0:1] * all_states[0] + \
+                weights[..., 1:2] * all_states[1] + \
+                weights[..., 2:3] * all_states[2]
+
         out = ln(core + self.dropout(proj(fused)))
         return out, weights
 
@@ -317,9 +322,10 @@ class STALLM_MIMO(nn.Module):
                  node_embeddings=None, use_node_embedding=True,
                  use_gcn=True,
                  dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine",
-                 use_revin=False, revin_affine=True, edge_index=None):
+                 use_revin=False, revin_affine=True, edge_index=None,use_fp16=False):
         super().__init__()
 
+        self.use_fp16 = use_fp16
         self.sample_len = sample_len
         self.output_len = output_len
         self.emb_dim = basemodel.emb_dim
@@ -400,7 +406,7 @@ class STALLM_MIMO(nn.Module):
         x_reshaped = x_flat.view(B, N, self.sample_len, -1)
         mask_reshaped = mask_flat.view(B, N, self.sample_len, -1)
 
-        # 💡 物理索引精確切片 (对齐 8 维新数据)
+        # 物理索引精確切片 (对齐 8 维新数据)
         x_f_4d = x_reshaped[..., [0, 1]].contiguous()
         m_f = mask_reshaped[..., [0, 1]].contiguous().view(B, N, -1)
 
@@ -445,32 +451,65 @@ class STALLM_MIMO(nn.Module):
             tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
 
         # 动态融合 + 独立后半程
-        # if self.use_sandglassAttn:
         if self.use_gcn:
             s_f = self.gcn_flow(tokens_f)
             s_wa = self.gcn_wave(tokens_wa)
             s_wi = self.gcn_wind(tokens_wi)
 
-            # s_f 等是 (B, T, N, D)，fusion 模块期望 (B, S, D)
-            # reshape 为 (B, T*N, D) 送入融合，出来再 reshape 回去
             B_f, T_f, N_f, D_f = s_f.shape
-            s_f_2d = s_f.view(B_f, T_f * N_f, D_f)
-            s_wa_2d = s_wa.view(B_f, T_f * N_f, D_f)
-            s_wi_2d = s_wi.view(B_f, T_f * N_f, D_f)
 
-            (aligned_f_2d, aligned_wa_2d, aligned_wi_2d), weight_dict = self.dynamic_fusion(s_f_2d, s_wa_2d, s_wi_2d)
-            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f) + spatialHint
-            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f) + spatialHint
-            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f) + spatialHint
+            # 优化：使用 Checkpoint 彻底压制融合阶段的显存堆积
+            def wrapper_fusion(f, wa, wi):
+                return self.dynamic_fusion(f, wa, wi)
+
+            alignedFList, alignedWaList, alignedWiList = [], [], []
+            weight_dict = {}
+            for t in range(T_f):
+                fT, waT, wiT = s_f[:, t, :, :], s_wa[:, t, :, :], s_wi[:, t, :, :]
+
+                # 使用 checkpoint 包装：计算完立刻释放内存，反向传播再重算
+                (aFT, aWaT, aWiT), wDict = checkpoint(wrapper_fusion, fT, waT, wiT, use_reentrant=False)
+
+                alignedFList.append(aFT)
+                alignedWaList.append(aWaT)
+                alignedWiList.append(aWiT)
+                if t == T_f - 1: weight_dict = wDict
+
+            aligned_f = torch.stack(alignedFList, dim=1) + spatialHint
+            aligned_wa = torch.stack(alignedWaList, dim=1) + spatialHint
+            aligned_wi = torch.stack(alignedWiList, dim=1) + spatialHint
 
             # aligned_f/wa/wi: (B, T, N, D)
             # 让 LLM 沿时间方向处理：reshape 为 (B*N, T, D)
             B_cur, T_cur, N_cur, D_cur = aligned_f.shape
 
+            # 统一的大模型推演逻辑
             def _run_llm(feat):
-                inp = feat.permute(0, 2, 1, 3).contiguous().view(B_cur * N_cur, T_cur, D_cur)
-                out = self.basemodel(inp)
-                return out.view(B_cur, N_cur, T_cur, D_cur).permute(0, 2, 1, 3).contiguous()
+                b_f, t_f, n_f, d_f = feat.shape
+                # 转换形状为 (B*N, T, D)
+                inp = feat.permute(0, 2, 1, 3).contiguous().view(b_f * n_f, t_f, d_f)
+
+                # 🚀 降维打击：将 chunk_size 压到 1024，显存压力再降 4 倍
+                chunk_size = 1024
+                out_list = []
+
+                for i in range(0, inp.shape[0], chunk_size):
+                    chunk = inp[i: i + chunk_size]
+
+                    # 核心：在 chunk 级别开启 checkpoint
+                    # 这样 PyTorch 就不会在显存里堆积这 15x3=45 个 chunk 的 Transformer 激活值了
+                    def chunk_forward(c):
+                        # 必须在 checkpoint 内部重新包裹 autocast，否则 FP16 会失效
+                        with torch.amp.autocast('cuda', enabled=self.use_fp16):
+                            return self.basemodel(c)
+
+                    # 执行 checkpoint
+                    chunk_out = checkpoint(chunk_forward, chunk, use_reentrant=False)
+                    out_list.append(chunk_out)
+
+                out = torch.cat(out_list, dim=0)
+                # 还原形状为 (B, T, N, D)
+                return out.view(b_f, n_f, t_f, d_f).permute(0, 2, 1, 3).contiguous()
 
             hidden_f = _run_llm(aligned_f)
             hidden_wa = _run_llm(aligned_wa)
@@ -481,15 +520,26 @@ class STALLM_MIMO(nn.Module):
             decoded_wi = hidden_wi + s_wi
         else:
             B_f, T_f, N_f, D_f = tokens_f.shape
-            t_f_2d = tokens_f.view(B_f, T_f * N_f, D_f)
-            t_wa_2d = tokens_wa.view(B_f, T_f * N_f, D_f)
-            t_wi_2d = tokens_wi.view(B_f, T_f * N_f, D_f)
 
-            (aligned_f_2d, aligned_wa_2d, aligned_wi_2d), weight_dict = self.dynamic_fusion(t_f_2d, t_wa_2d, t_wi_2d)
+            # 显存优化：同上
+            alignedFList = []
+            alignedWaList = []
+            alignedWiList = []
+            weight_dict = {}
+            for t in range(T_f):
+                fT = tokens_f[:, t, :, :]
+                waT = tokens_wa[:, t, :, :]
+                wiT = tokens_wi[:, t, :, :]
+                (aFT, aWaT, aWiT), wDict = self.dynamic_fusion(fT, waT, wiT)
+                alignedFList.append(aFT)
+                alignedWaList.append(aWaT)
+                alignedWiList.append(aWiT)
+                if t == T_f - 1:
+                    weight_dict = wDict
 
-            aligned_f = aligned_f_2d.view(B_f, T_f, N_f, D_f) + spatialHint
-            aligned_wa = aligned_wa_2d.view(B_f, T_f, N_f, D_f) + spatialHint
-            aligned_wi = aligned_wi_2d.view(B_f, T_f, N_f, D_f) + spatialHint
+            aligned_f = torch.stack(alignedFList, dim=1) + spatialHint
+            aligned_wa = torch.stack(alignedWaList, dim=1) + spatialHint
+            aligned_wi = torch.stack(alignedWiList, dim=1) + spatialHint
 
             B_cur, T_cur, N_cur, D_cur = aligned_f.shape
 

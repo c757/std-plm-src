@@ -391,7 +391,7 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
     chosen_vars = args.predict_vars.split(',') 
     fusion_stats = _init_fusion_stats()
 
-    for input, target, timestamp, cond_mask, ob_mask in loader:
+    for batch_idx, (input, target, timestamp, cond_mask, ob_mask) in enumerate(loader):
         input, target, timestamp = input.to(device), target.to(device), timestamp.to(device)
         cond_mask, ob_mask = cond_mask.to(device), ob_mask.to(device)
         model_input = torch.where(cond_mask == 0, 0, input)
@@ -454,6 +454,13 @@ def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_
             else:
                 L.backward()
                 optim.step()
+
+        if (batch_idx + 1) % 100 == 0:
+            total_batches = len(loader)
+            progress = (batch_idx + 1) / total_batches * 100
+            print(
+                f"[Progress: {progress:.1f}%] Batch {batch_idx + 1}/{total_batches} | Current Loss: {total_loss.item():.5f}")
+
 
     return (loss_item / count if count else 0), _finalize_fusion_stats(fusion_stats)
 
@@ -715,7 +722,7 @@ if __name__ == '__main__':
                         use_gcn=args.use_gcn,
                         dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
                         fusion_mode=args.fusion_mode,
-                        use_revin=args.revin, revin_affine=args.revin_affine).to(device)
+                        use_revin=args.revin, revin_affine=args.revin_affine,use_fp16=args.fp16).to(device)
 
     total_params, total_trainable_params = model.params_num()
     mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')
