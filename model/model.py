@@ -374,7 +374,7 @@ class STALLM_MIMO(nn.Module):
 
         # 基礎組件
         self.timeembedding = TimeEmbedding(t_dim=t_dim)
-        if use_node_embedding:
+        if use_node_embedding and node_embeddings is not None:
             self.node_embd_layer = NodeEmbedding(node_embeddings, node_emb_dim, trunc_k, dropout)
             self.llmSpatialProj = nn.Linear(node_emb_dim, self.emb_dim)
 

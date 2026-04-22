@@ -514,7 +514,9 @@ def TestEpoch(args, loader, model, prompt_prefix, scaler, save=False, LOG_DIR=No
 
             # 矢量 RMSE：对有两个分量（u/v）的变量计算
             vrmse = None
-            if all_preds.shape[-1] >= 2:
+
+            vector_vars = ['flow', 'wind']
+            if var in vector_vars and all_preds.shape[-1] >= 2:
                 ocean_mask = all_masks[..., 0]
                 vrmse = VRMSE_torch(
                     all_preds[..., 0][ocean_mask], all_preds[..., 1][ocean_mask],
@@ -687,8 +689,15 @@ if __name__ == '__main__':
     train_loader, val_loader, test_loader = dataloaders['train'], dataloaders['val'], dataloaders['test']
     
     scaler = OceanScaler(f'{ocean_data_dir}/norm_mean.npy', f'{ocean_data_dir}/norm_std.npy', device)
-    node_embeddings = load_ocean_laplacian_embeddings(ocean_data_dir, K=args.trunc_k).to(device)
-    edge_index = load_ocean_edge_index(ocean_data_dir).to(device)
+    node_embeddings = None
+    if args.node_embedding:
+        print("正在加载节点嵌入...")
+        node_embeddings = load_ocean_laplacian_embeddings(ocean_data_dir, K=args.trunc_k).to(device)
+
+    edge_index = None
+    if args.use_gcn:
+        print("正在加载图边缘索引...")
+        edge_index = load_ocean_edge_index(ocean_data_dir).to(device)
 
     safe_time_str = get_time_str().replace(':', '-')
     LOG_DIR = os.path.join(args.log_root, f'{safe_time_str}_{args.desc}_{random_str()}')

@@ -7,7 +7,7 @@ from scipy.sparse.linalg import eigsh
 import os
 
 
-def load_ocean_edge_index(data_dir, add_self_loops=True, bidirectional=True):
+def load_ocean_edge_index(data_dir, add_self_loops=True, bidirectional=False):
     """Load graph edges from ocean_adj.csv as a 2xE torch long tensor."""
     edges = pd.read_csv(f'{data_dir}/ocean_adj.csv')
     src = edges['from'].to_numpy(dtype=np.int64)
