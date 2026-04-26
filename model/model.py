@@ -189,13 +189,11 @@ class Node2Token_MultiScaleCNN(nn.Module):
 
     def _state_token(self, te, ne, B, N):
         T = te.shape[1]
-        # te: (B, T, tim_dim) -> (B, T, N, tim_dim)
-        state = te.unsqueeze(2).repeat(1, 1, N, 1)
+        state = te.unsqueeze(2).expand(B, T, N, -1)
         if self.use_node_embedding:
-            # ne: (N, node_emb_dim) -> (B, T, N, node_emb_dim)
-            ne = ne.unsqueeze(0).unsqueeze(0).repeat(B, T, 1, 1)
-            state = torch.concat((state, ne), dim=-1)
-        return self.state_fc(state)  # (B, T, N, emb_dim)
+            ne_exp = ne.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
+            state = torch.cat((state, ne_exp), dim=-1)
+        return self.state_fc(state)
 
     def _legacy_tokenize(self, x, mask):
         B, N, TF = x.shape
