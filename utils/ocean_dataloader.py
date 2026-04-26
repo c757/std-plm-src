@@ -30,27 +30,46 @@ def load_ocean_edge_index(data_dir, add_self_loops=True, bidirectional=False):
     edge_index = np.stack([src, dst], axis=0)
     return torch.tensor(edge_index, dtype=torch.long)
 
+
 def load_ocean_laplacian_embeddings(data_dir, K=64):
-    print("正在计算稀疏拉普拉斯拓扑嵌入...")
+    # 【新增 1】：定义极其严谨的缓存路径
+    # 将缓存保存在当前数据集目录下，并且把超参数 K 写进文件名
+    cache_path = os.path.join(data_dir, f'laplacian_emb_K{K}.pt')
+
+    # 【新增 2】：拦截逻辑 —— 如果有缓存，直接秒进！
+    if os.path.exists(cache_path):
+        print(f"[Cache Hit] 加载拉普拉斯拓扑缓存: {os.path.basename(cache_path)}")
+        return torch.load(cache_path)
+
+    # 如果没命中缓存，才开始真正的苦力活
+    print(f"[Cache Miss] 正在计算稀疏拉普拉斯拓扑嵌入(K={K})...")
     import json
     with open(f'{data_dir}/meta.json', 'r') as f:
         n_nodes = json.load(f)['n_nodes']
-        
+
     edges = pd.read_csv(f'{data_dir}/ocean_adj.csv')
     A = sp.coo_matrix((edges['cost'], (edges['from'], edges['to'])), shape=(n_nodes, n_nodes), dtype=np.float32)
     A = A + A.T.multiply(A.T > A) - A.multiply(A.T > A)
     A = A + sp.eye(n_nodes)
-    
+
     degree = np.array(A.sum(1)).flatten()
     d_inv_sqrt = np.power(degree, -0.5)
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
     D_inv_sqrt = sp.diags(d_inv_sqrt)
     L = sp.eye(n_nodes) - D_inv_sqrt.dot(A).dot(D_inv_sqrt)
-    
-    # 【修复1】：使用 sigma=0 的平移反转法，又快又准
-    eigenvalues, eigenvectors = eigsh(L, k=K, which='LM', sigma=-1e-5, ncv=5*K)
-    return torch.tensor(eigenvectors, dtype=torch.float32)
-    
+
+    eigenvalues, eigenvectors = eigsh(L, k=K, which='LM', sigma=-1e-5, ncv=5 * K)
+
+    # 转为 PyTorch 张量
+    lap_emb = torch.tensor(eigenvectors, dtype=torch.float32)
+
+    # 【新增 3】：计算完毕后，立刻落盘保存
+    torch.save(lap_emb, cache_path)
+    print(f"计算完成！已缓存至: {cache_path}")
+
+    return lap_emb
+
+
 class OceanDataset(Dataset):
     def __init__(self, data_path, indices_path, split='train', sample_len=9, predict_len=3, input_layout='node'):
         data_dir = os.path.dirname(data_path)
@@ -62,7 +81,7 @@ class OceanDataset(Dataset):
         self.sample_len = sample_len
         self.predict_len = predict_len
         self.window = sample_len + predict_len
-        
+
         # 【修复3】：让搬运工认识真实的海洋地图和真实的时间
         mask_2d_path = f'{data_dir}/ocean_mask_2d.npy'
         mask_1d_path = f'{data_dir}/ocean_mask.npy'
@@ -93,7 +112,7 @@ class OceanDataset(Dataset):
     def __getitem__(self, idx):
         start_t = self.indices[idx]
         end_t = start_t + self.window
-        
+
         window_data = self.data[start_t:end_t]
         if self.is_grid_layout and self.input_layout == 'grid':
             # Commit-1: output true 5D tensors for model bridge path.
@@ -107,14 +126,14 @@ class OceanDataset(Dataset):
                 window_data = window_data.reshape(tw, h * w, c)
             x = torch.tensor(window_data[:self.sample_len].copy(), dtype=torch.float32)
             y = torch.tensor(window_data[self.sample_len:].copy(), dtype=torch.float32)
-        
+
         # 【修复4】：传入真实的时间 (星期、小时、分钟)
         t_slice = self.timestamps[start_t:end_t]
         timestamp = torch.zeros((self.window, 5), dtype=torch.float32)
         timestamp[:, 2] = torch.tensor(t_slice.dayofweek.values)
         timestamp[:, 3] = torch.tensor(t_slice.hour.values)
         timestamp[:, 4] = torch.tensor(t_slice.minute.values)
-        
+
         # 【修复5】：给陆地打上 0 的标签，模型算误差时会自动忽略陆地
         if self.is_grid_layout and self.input_layout == 'grid' and self.ocean_mask_2d is not None:
             # x: (sample_len, C, H, W), y: (predict_len, C, H, W)
@@ -124,9 +143,11 @@ class OceanDataset(Dataset):
             ob_mask = torch.ones((self.window, x.shape[1], x.shape[2], x.shape[3]), dtype=torch.float32) * mask_view
         else:
             cond_mask = torch.ones_like(x) * self.ocean_mask_1d.view(1, -1, 1)
-            ob_mask = torch.ones((self.window, x.shape[1], x.shape[2]), dtype=torch.float32) * self.ocean_mask_1d.view(1, -1, 1)
-        
+            ob_mask = torch.ones((self.window, x.shape[1], x.shape[2]), dtype=torch.float32) * self.ocean_mask_1d.view(
+                1, -1, 1)
+
         return x, y, timestamp, cond_mask, ob_mask
+
 
 def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='node',
                           expected_sample_len=None, expected_predict_len=None):
@@ -171,7 +192,7 @@ def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='
         )
 
     print(f'[DataLoader] input_layout={layout}, using file: {os.path.basename(data_path)}')
-    
+
     datasets = {}
     dataloaders = {}
     for split in ['train', 'val', 'test']:
@@ -183,5 +204,6 @@ def get_ocean_dataloaders(data_dir, batch_size=16, num_workers=4, input_layout='
             predict_len=meta['predict_len'],
             input_layout=layout,
         )
-        dataloaders[split] = DataLoader(datasets[split], batch_size=batch_size, shuffle=(split == 'train'), num_workers=num_workers, pin_memory=True)
+        dataloaders[split] = DataLoader(datasets[split], batch_size=batch_size, shuffle=(split == 'train'),
+                                        num_workers=num_workers, pin_memory=True)
     return dataloaders

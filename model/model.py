@@ -478,7 +478,7 @@ class STALLM_MIMO(nn.Module):
                 chunk = feat[:, :, i:i + node_chunk, :].permute(0, 2, 1, 3).contiguous()
                 nc = chunk.shape[1]
                 chunk = chunk.view(b_f * nc, t_f, d_f)
-                out = self.basemodel(chunk)
+                out = checkpoint(self.basemodel, chunk, use_reentrant=False)
                 out_chunks.append(out.view(b_f, nc, t_f, d_f))
                 del out, chunk
             return torch.cat(out_chunks, dim=1).permute(0, 2, 1, 3).contiguous()
