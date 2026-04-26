@@ -381,8 +381,9 @@ class OceanScaler:
 
     def inverse_transform(self, data, var_name):
         idx = self.var_indices[var_name]
-        m = self.mean[idx].view(1, 1, 1, -1)
-        s = self.std[idx].view(1, 1, 1, -1)
+        shape = [1] * (data.ndim - 1) + [-1]
+        m = self.mean[idx].view(shape)
+        s = self.std[idx].view(shape)
         return data * s + m
 
 def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool, amp_cfg=None, amp_scaler=None):
@@ -765,7 +766,7 @@ if __name__ == '__main__':
                         use_gcn=args.use_gcn,
                         dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
                         fusion_mode=args.fusion_mode,
-                        use_revin=args.revin, revin_affine=args.revin_affine,use_fp16=args.fp16).to(device)
+                        use_revin=args.revin, revin_affine=args.revin_affine).to(device)
 
     total_params, total_trainable_params = model.params_num()
     mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')

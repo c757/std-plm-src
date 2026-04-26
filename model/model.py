@@ -320,10 +320,10 @@ class STALLM_MIMO(nn.Module):
                  node_embeddings=None, use_node_embedding=True,
                  use_gcn=True,
                  dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine",
-                 use_revin=False, revin_affine=True, edge_index=None,use_fp16=False):
+                 use_revin=False, revin_affine=True, edge_index=None):
         super().__init__()
 
-        self.use_fp16 = use_fp16
+
         self.sample_len = sample_len
         self.output_len = output_len
         self.emb_dim = basemodel.emb_dim
