@@ -381,8 +381,9 @@ class OceanScaler:
 
     def inverse_transform(self, data, var_name):
         idx = self.var_indices[var_name]
-        m = self.mean[idx].view(1, 1, 1, -1)
-        s = self.std[idx].view(1, 1, 1, -1)
+        shape = [1] * (data.ndim - 1) + [-1]
+        m = self.mean[idx].view(shape)
+        s = self.std[idx].view(shape)
         return data * s + m
 
 def TrainEpoch(args, loader, model, optim, loss_fn, prompt_prefix, scaler, need_step: bool, amp_cfg=None, amp_scaler=None):
@@ -551,6 +552,23 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
         else:
             mylogger.warning(f"[AMP] fp16 requested but disabled: {amp_cfg['reason']}")
 
+    start_epoch = 0
+    resume_path = getattr(args, 'resume_path', None)
+    if resume_path and os.path.exists(resume_path):
+        mylogger.info(f"[Resume] 从 {resume_path} 恢复训练...")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        optim.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        if amp_scaler is not None and 'amp_scaler_state_dict' in ckpt:
+            amp_scaler.load_state_dict(ckpt['amp_scaler_state_dict'])
+        start_epoch = ckpt['epoch'] + 1
+        best_loss = ckpt['best_loss']
+        patience_count = ckpt['patience_count']
+        if 'history' in ckpt:
+            history = ckpt['history']
+        mylogger.info(f"[Resume] 从 Epoch {start_epoch} 继续，best_loss={best_loss:.4f}")
+
     tb_writer = None
     if getattr(args, 'tensorboard', False):
         if SummaryWriter is None:
@@ -561,7 +579,7 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
             tb_writer = SummaryWriter(log_dir=tb_dir)
             mylogger.info(f'[TensorBoard] logging to: {tb_dir}')
 
-    for epoch in range(args.epoch):
+    for epoch in range(start_epoch, args.epoch):
         train_loss, train_fusion = TrainEpoch(args, train_loader, model, optim, loss_fn, prompt_prefix, scaler,
                                               need_step=True, amp_cfg=amp_cfg, amp_scaler=amp_scaler)
         history['train_loss']['x'].append(epoch)
@@ -613,6 +631,23 @@ def Train(args, mylogger, model, prompt_prefix, scaler, train_loader, val_loader
                     f"{_format_named_metric(acc, var, 'ACC')}"
                     f"{vrmse_str}"
                 )
+
+        ckpt_dir = os.path.join(args.log_root, 'checkpoints')
+        check_dir(ckpt_dir, mkdir=True)
+        ckpt_path = os.path.join(ckpt_dir, f"{args.desc}_latest.pt")
+        ckpt = {
+            'epoch': epoch,
+            'model_state_dict': model.grad_state_dict(),
+            'optimizer_state_dict': optim.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_loss': best_loss,
+            'patience_count': patience_count,
+            'history': history,
+        }
+        if amp_scaler is not None:
+            ckpt['amp_scaler_state_dict'] = amp_scaler.state_dict()
+        torch.save(ckpt, ckpt_path)
+        mylogger.info(f"[Checkpoint] 已存档至 {ckpt_path}")
 
         if patience_count >= args.patience:
             mylogger.info('early stop')
@@ -731,7 +766,7 @@ if __name__ == '__main__':
                         use_gcn=args.use_gcn,
                         dropout=args.dropout, trunc_k=args.trunc_k, t_dim=args.t_dim,
                         fusion_mode=args.fusion_mode,
-                        use_revin=args.revin, revin_affine=args.revin_affine,use_fp16=args.fp16).to(device)
+                        use_revin=args.revin, revin_affine=args.revin_affine).to(device)
 
     total_params, total_trainable_params = model.params_num()
     mylogger.info(f'Total Params: {total_params} | Trainable: {total_trainable_params}')

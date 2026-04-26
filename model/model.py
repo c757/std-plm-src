@@ -189,13 +189,11 @@ class Node2Token_MultiScaleCNN(nn.Module):
 
     def _state_token(self, te, ne, B, N):
         T = te.shape[1]
-        # te: (B, T, tim_dim) -> (B, T, N, tim_dim)
-        state = te.unsqueeze(2).repeat(1, 1, N, 1)
+        state = te.unsqueeze(2).expand(B, T, N, -1)
         if self.use_node_embedding:
-            # ne: (N, node_emb_dim) -> (B, T, N, node_emb_dim)
-            ne = ne.unsqueeze(0).unsqueeze(0).repeat(B, T, 1, 1)
-            state = torch.concat((state, ne), dim=-1)
-        return self.state_fc(state)  # (B, T, N, emb_dim)
+            ne_exp = ne.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
+            state = torch.cat((state, ne_exp), dim=-1)
+        return self.state_fc(state)
 
     def _legacy_tokenize(self, x, mask):
         B, N, TF = x.shape
@@ -322,10 +320,10 @@ class STALLM_MIMO(nn.Module):
                  node_embeddings=None, use_node_embedding=True,
                  use_gcn=True,
                  dropout=0, trunc_k=16, t_dim=64, fusion_mode="cosine",
-                 use_revin=False, revin_affine=True, edge_index=None,use_fp16=False):
+                 use_revin=False, revin_affine=True, edge_index=None):
         super().__init__()
 
-        self.use_fp16 = use_fp16
+
         self.sample_len = sample_len
         self.output_len = output_len
         self.emb_dim = basemodel.emb_dim
@@ -377,6 +375,10 @@ class STALLM_MIMO(nn.Module):
         if use_node_embedding and node_embeddings is not None:
             self.node_embd_layer = NodeEmbedding(node_embeddings, node_emb_dim, trunc_k, dropout)
             self.llmSpatialProj = nn.Linear(node_emb_dim, self.emb_dim)
+
+        self.time_pool_f = nn.Linear(self.sample_len, 1)
+        self.time_pool_wa = nn.Linear(self.sample_len, 1)
+        self.time_pool_wi = nn.Linear(self.sample_len, 1)
 
     def forward(self, x, timestamp, prompt_prefix, mask):
         # Commit-1 adapter: accept both legacy 3D input and new 5D grid input.
@@ -450,122 +452,74 @@ class STALLM_MIMO(nn.Module):
             tokens_wa = self.tokenizer_wave(x_wa, te, ne, m_wa)
             tokens_wi = self.tokenizer_wind(x_wi, te, ne, m_wi)
 
-        # 动态融合 + 独立后半程
+        # =========================================================
+        # 彻底重构：独立 LLM -> 时间池化 (Time Pooling) -> 后置融合
+        # =========================================================
+
+        # 1. 拓扑感知 (GCN)
         if self.use_gcn:
             s_f = self.gcn_flow(tokens_f)
             s_wa = self.gcn_wave(tokens_wa)
             s_wi = self.gcn_wind(tokens_wi)
+        else:
+            s_f, s_wa, s_wi = tokens_f, tokens_wa, tokens_wi
 
-            B_f, T_f, N_f, D_f = s_f.shape
+        # 加上空间提示 (spatialHint)
+        aligned_f = s_f + spatialHint
+        aligned_wa = s_wa + spatialHint
+        aligned_wi = s_wi + spatialHint
 
-            # 优化：使用 Checkpoint 彻底压制融合阶段的显存堆积
+        # 统一的大模型推演逻辑 (Node Chunking 防止 OOM)
+        def _run_llm(feat):
+            b_f, t_f, n_f, d_f = feat.shape
+            node_chunk = 512
+            out_chunks = []
+            for i in range(0, n_f, node_chunk):
+                chunk = feat[:, :, i:i + node_chunk, :].permute(0, 2, 1, 3).contiguous()
+                nc = chunk.shape[1]
+                chunk = chunk.view(b_f * nc, t_f, d_f)
+                out = self.basemodel(chunk)
+                out_chunks.append(out.view(b_f, nc, t_f, d_f))
+                del out, chunk
+            return torch.cat(out_chunks, dim=1).permute(0, 2, 1, 3).contiguous()
+
+        # 2. 独立运行 LLM (榨干时序特征，三路互不干扰)
+        decoded_f = _run_llm(aligned_f) + s_f
+        del aligned_f;
+        torch.cuda.empty_cache()
+
+        decoded_wa = _run_llm(aligned_wa) + s_wa
+        del aligned_wa;
+        torch.cuda.empty_cache()
+
+        decoded_wi = _run_llm(aligned_wi) + s_wi
+        del aligned_wi;
+        torch.cuda.empty_cache()
+
+        # 3. 时序压缩 (Time Pooling)：(B, T, N, D) -> (B, N, D)
+        # 榨干 9 个时间步的所有信息，通过可学习权重合成最终的空间特征
+        agg_f = self.time_pool_f(decoded_f.permute(0, 2, 3, 1)).squeeze(-1)
+        agg_wa = self.time_pool_wa(decoded_wa.permute(0, 2, 3, 1)).squeeze(-1)
+        agg_wi = self.time_pool_wi(decoded_wi.permute(0, 2, 3, 1)).squeeze(-1)
+
+        del decoded_f, decoded_wa, decoded_wi;
+        torch.cuda.empty_cache()
+
+        # 4. 后置深度融合 (Late Fusion)
+        # 特征已被 LLM 高度抽象，此时融合能提取到极具物理意义的跨模态影响
+        if self.fusion_mode == 'qkv':
             def wrapper_fusion(f, wa, wi):
                 return self.dynamic_fusion(f, wa, wi)
 
-            alignedFList, alignedWaList, alignedWiList = [], [], []
-            weight_dict = {}
-            for t in range(T_f):
-                fT, waT, wiT = s_f[:, t, :, :], s_wa[:, t, :, :], s_wi[:, t, :, :]
-
-                # 使用 checkpoint 包装：计算完立刻释放内存，反向传播再重算
-                (aFT, aWaT, aWiT), wDict = checkpoint(wrapper_fusion, fT, waT, wiT, use_reentrant=False)
-
-                alignedFList.append(aFT)
-                alignedWaList.append(aWaT)
-                alignedWiList.append(aWiT)
-                if t == T_f - 1: weight_dict = wDict
-
-            aligned_f = torch.stack(alignedFList, dim=1) + spatialHint
-            aligned_wa = torch.stack(alignedWaList, dim=1) + spatialHint
-            aligned_wi = torch.stack(alignedWiList, dim=1) + spatialHint
-
-            # aligned_f/wa/wi: (B, T, N, D)
-            # 让 LLM 沿时间方向处理：reshape 为 (B*N, T, D)
-            B_cur, T_cur, N_cur, D_cur = aligned_f.shape
-
-            # 统一的大模型推演逻辑
-            def _run_llm(feat):
-                b_f, t_f, n_f, d_f = feat.shape
-                # 转换形状为 (B*N, T, D)
-                inp = feat.permute(0, 2, 1, 3).contiguous().view(b_f * n_f, t_f, d_f)
-
-                # 🚀 降维打击：将 chunk_size 压到 1024，显存压力再降 4 倍
-                chunk_size = 1024
-                out_list = []
-
-                for i in range(0, inp.shape[0], chunk_size):
-                    chunk = inp[i: i + chunk_size]
-
-                    # 核心：在 chunk 级别开启 checkpoint
-                    # 这样 PyTorch 就不会在显存里堆积这 15x3=45 个 chunk 的 Transformer 激活值了
-                    def chunk_forward(c):
-                        # 必须在 checkpoint 内部重新包裹 autocast，否则 FP16 会失效
-                        with torch.amp.autocast('cuda', enabled=self.use_fp16):
-                            return self.basemodel(c)
-
-                    # 执行 checkpoint
-                    chunk_out = checkpoint(chunk_forward, chunk, use_reentrant=False)
-                    out_list.append(chunk_out)
-
-                out = torch.cat(out_list, dim=0)
-                # 还原形状为 (B, T, N, D)
-                return out.view(b_f, n_f, t_f, d_f).permute(0, 2, 1, 3).contiguous()
-
-            hidden_f = _run_llm(aligned_f)
-            hidden_wa = _run_llm(aligned_wa)
-            hidden_wi = _run_llm(aligned_wi)
-
-            decoded_f = hidden_f + s_f
-            decoded_wa = hidden_wa + s_wa
-            decoded_wi = hidden_wi + s_wi
+            (f_fused, wa_fused, wi_fused), weight_dict = checkpoint(wrapper_fusion, agg_f, agg_wa, agg_wi,
+                                                                    use_reentrant=False)
         else:
-            B_f, T_f, N_f, D_f = tokens_f.shape
+            (f_fused, wa_fused, wi_fused), weight_dict = self.dynamic_fusion(agg_f, agg_wa, agg_wi)
 
-            # 显存优化：同上
-            alignedFList = []
-            alignedWaList = []
-            alignedWiList = []
-            weight_dict = {}
-            for t in range(T_f):
-                fT = tokens_f[:, t, :, :]
-                waT = tokens_wa[:, t, :, :]
-                wiT = tokens_wi[:, t, :, :]
-                (aFT, aWaT, aWiT), wDict = self.dynamic_fusion(fT, waT, wiT)
-                alignedFList.append(aFT)
-                alignedWaList.append(aWaT)
-                alignedWiList.append(aWiT)
-                if t == T_f - 1:
-                    weight_dict = wDict
-
-            aligned_f = torch.stack(alignedFList, dim=1) + spatialHint
-            aligned_wa = torch.stack(alignedWaList, dim=1) + spatialHint
-            aligned_wi = torch.stack(alignedWiList, dim=1) + spatialHint
-
-            B_cur, T_cur, N_cur, D_cur = aligned_f.shape
-
-            def _run_llm(feat):
-                inp = feat.permute(0, 2, 1, 3).contiguous().view(B_cur * N_cur, T_cur, D_cur)
-                out = self.basemodel(inp)
-                return out.view(B_cur, N_cur, T_cur, D_cur).permute(0, 2, 1, 3).contiguous()
-
-            hidden_f = _run_llm(aligned_f)
-            hidden_wa = _run_llm(aligned_wa)
-            hidden_wi = _run_llm(aligned_wi)
-
-            decoded_f = hidden_f + tokens_f
-            decoded_wa = hidden_wa + tokens_wa
-            decoded_wi = hidden_wi + tokens_wi
-
-        # decoded: (B, T, N, D) -> 取最后一个时间步作为预测起点
-        # 这与 LLM 自回归输出习惯一致：用序列末尾 token 做预测
-        def _decode(decoded, head, out_len, feat_dim):
-            # 取最后一个时间步: (B, T, N, D) -> (B, N, D)
-            last = decoded[:, -1, :, :]
-            return head(last).view(B, N, out_len, feat_dim)
-
-        pred_flow = _decode(decoded_f, self.head_flow, self.output_len, self.dims['flow'])
-        pred_wave = _decode(decoded_wa, self.head_wave, self.output_len, self.dims['wave'])
-        pred_wind = _decode(decoded_wi, self.head_wind, self.output_len, self.dims['wind'])
+        # 5. 独立解码 (B, N, D) -> (B, N, out_len, feat_dim)
+        pred_flow = self.head_flow(f_fused).view(B, N, self.output_len, self.dims['flow'])
+        pred_wave = self.head_wave(wa_fused).view(B, N, self.output_len, self.dims['wave'])
+        pred_wind = self.head_wind(wi_fused).view(B, N, self.output_len, self.dims['wind'])
 
         # RevIN 反归一化：将预测恢复到输入窗口对应的原始尺度
         if self.use_revin:
