@@ -113,6 +113,9 @@ def InitArgs():
 
     parser.add_argument("--save_result" , action="store_true")
 
+    parser.add_argument("--resume_path", default=None, type=str,
+                        help="Path to checkpoint for resuming training")
+
     parser.add_argument("--few_shot" , default=1, type=float)
 
     parser.add_argument("--node_shuffle_seed" , default=None, type=int)
