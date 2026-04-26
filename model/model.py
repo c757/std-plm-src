@@ -484,38 +484,28 @@ class STALLM_MIMO(nn.Module):
             # 统一的大模型推演逻辑
             def _run_llm(feat):
                 b_f, t_f, n_f, d_f = feat.shape
-                # 转换形状为 (B*N, T, D)
-                inp = feat.permute(0, 2, 1, 3).contiguous().view(b_f * n_f, t_f, d_f)
+                node_chunk = 512
+                out_chunks = []
+                for i in range(0, n_f, node_chunk):
+                    chunk = feat[:, :, i:i + node_chunk, :].permute(0, 2, 1, 3).contiguous()
+                    nc = chunk.shape[1]
+                    chunk = chunk.view(b_f * nc, t_f, d_f)
+                    out = self.basemodel(chunk)
+                    out_chunks.append(out.view(b_f, nc, t_f, d_f))
+                    del out, chunk
+                return torch.cat(out_chunks, dim=1).permute(0, 2, 1, 3).contiguous()
 
-                # 🚀 降维打击：将 chunk_size 压到 1024，显存压力再降 4 倍
-                chunk_size = 1024
-                out_list = []
+            decoded_f = _run_llm(aligned_f) + s_f
+            del aligned_f
+            torch.cuda.empty_cache()
 
-                for i in range(0, inp.shape[0], chunk_size):
-                    chunk = inp[i: i + chunk_size]
+            decoded_wa = _run_llm(aligned_wa) + s_wa
+            del aligned_wa
+            torch.cuda.empty_cache()
 
-                    # 核心：在 chunk 级别开启 checkpoint
-                    # 这样 PyTorch 就不会在显存里堆积这 15x3=45 个 chunk 的 Transformer 激活值了
-                    def chunk_forward(c):
-                        # 必须在 checkpoint 内部重新包裹 autocast，否则 FP16 会失效
-                        with torch.amp.autocast('cuda', enabled=self.use_fp16):
-                            return self.basemodel(c)
-
-                    # 执行 checkpoint
-                    chunk_out = checkpoint(chunk_forward, chunk, use_reentrant=False)
-                    out_list.append(chunk_out)
-
-                out = torch.cat(out_list, dim=0)
-                # 还原形状为 (B, T, N, D)
-                return out.view(b_f, n_f, t_f, d_f).permute(0, 2, 1, 3).contiguous()
-
-            hidden_f = _run_llm(aligned_f)
-            hidden_wa = _run_llm(aligned_wa)
-            hidden_wi = _run_llm(aligned_wi)
-
-            decoded_f = hidden_f + s_f
-            decoded_wa = hidden_wa + s_wa
-            decoded_wi = hidden_wi + s_wi
+            decoded_wi = _run_llm(aligned_wi) + s_wi
+            del aligned_wi
+            torch.cuda.empty_cache()
         else:
             B_f, T_f, N_f, D_f = tokens_f.shape
 
@@ -542,17 +532,29 @@ class STALLM_MIMO(nn.Module):
             B_cur, T_cur, N_cur, D_cur = aligned_f.shape
 
             def _run_llm(feat):
-                inp = feat.permute(0, 2, 1, 3).contiguous().view(B_cur * N_cur, T_cur, D_cur)
-                out = self.basemodel(inp)
-                return out.view(B_cur, N_cur, T_cur, D_cur).permute(0, 2, 1, 3).contiguous()
+                b_f, t_f, n_f, d_f = feat.shape
+                node_chunk = 512
+                out_chunks = []
+                for i in range(0, n_f, node_chunk):
+                    chunk = feat[:, :, i:i + node_chunk, :].permute(0, 2, 1, 3).contiguous()
+                    nc = chunk.shape[1]
+                    chunk = chunk.view(b_f * nc, t_f, d_f)
+                    out = self.basemodel(chunk)
+                    out_chunks.append(out.view(b_f, nc, t_f, d_f))
+                    del out, chunk
+                return torch.cat(out_chunks, dim=1).permute(0, 2, 1, 3).contiguous()
 
-            hidden_f = _run_llm(aligned_f)
-            hidden_wa = _run_llm(aligned_wa)
-            hidden_wi = _run_llm(aligned_wi)
+            decoded_f = _run_llm(aligned_f) + tokens_f
+            del aligned_f
+            torch.cuda.empty_cache()
 
-            decoded_f = hidden_f + tokens_f
-            decoded_wa = hidden_wa + tokens_wa
-            decoded_wi = hidden_wi + tokens_wi
+            decoded_wa = _run_llm(aligned_wa) + tokens_wa
+            del aligned_wa
+            torch.cuda.empty_cache()
+
+            decoded_wi = _run_llm(aligned_wi) + tokens_wi
+            del aligned_wi
+            torch.cuda.empty_cache()
 
         # decoded: (B, T, N, D) -> 取最后一个时间步作为预测起点
         # 这与 LLM 自回归输出习惯一致：用序列末尾 token 做预测
